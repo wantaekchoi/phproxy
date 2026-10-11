@@ -1,12 +1,16 @@
-name: lint
+name: checks
 
 on:
   push:
     branches: [master, revive]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
-  php-lint:
+  php:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -14,8 +18,72 @@ jobs:
         php: ["8.1", "8.5"]
     container: php:${{ matrix.php }}-cli
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Syntax check every PHP file
         run: |
           set -e
-          find . -type f -name '*.php' -print -exec php -l {} \;
+          find . -type f -name '*.php' -exec sh -c 'for file do php -l "$file" || exit 1; done' sh {} +
+      - name: Run regression tests
+        run: |
+          set -e
+          php tests/transport.php
+          php tests/browser.php
+          php tests/ui.php
+          php tests/cli.php
+          php tests/panel.php
+
+  image:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build image for smoke testing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: phproxy:smoke
+          provenance: false
+      - name: Verify the baked application in Apache
+        env:
+          IMAGE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          trap 'docker logs phproxy-smoke; docker rm -f phproxy-smoke' EXIT
+          docker run -d --name phproxy-smoke --platform "$IMAGE_PLATFORM" \
+            --network none --read-only --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+            --tmpfs /var/run/apache2:rw,noexec,nosuid,size=1m \
+            --tmpfs /var/lock/apache2:rw,noexec,nosuid,size=1m phproxy:smoke
+          docker exec phproxy-smoke php -l /var/www/html/index.php
+          docker exec phproxy-smoke php -r '
+            foreach (["openssl", "mbstring", "zlib", "session"] as $extension) {
+              if (!extension_loaded($extension)) { fwrite(STDERR, "Missing $extension\n"); exit(1); }
+            }
+            if (fileowner("/var/www/html/index.php") !== 0 || fileowner("/var/www/html") !== 0) exit(1);
+          '
+          ready=0
+          for _ in $(seq 1 20); do
+            if docker exec phproxy-smoke curl --fail --silent --max-time 3 \
+              http://127.0.0.1/ > /tmp/phproxy-home.html; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          grep -q PHProxy /tmp/phproxy-home.html
+          grep -q '</html>' /tmp/phproxy-home.html
+          for asset in index.css panel.css netcheck.js; do
+            docker exec phproxy-smoke curl --fail --silent --max-time 3 \
+              --output /dev/null "http://127.0.0.1/?asset=$asset"
+          done
+          if docker logs phproxy-smoke 2>&1 | grep -E 'PHP (Fatal error|Parse error|Warning|Deprecated)'; then
+            exit 1
+          fi

@@ -1,0 +1,7 @@
+services:
+  phproxy:
+    image: phproxy:dev
+    build: .
+    pull_policy: build
+    volumes:
+      - ./index.php:/var/www/html/index.php:ro

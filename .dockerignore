@@ -1,6 +1,3 @@
-.git
-.github
-.gitignore
-.dockerignore
-docker-compose.yml
-Dockerfile
+**
+!index.php
+!LICENSE.md

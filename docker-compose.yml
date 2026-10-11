@@ -1,12 +1,18 @@
 services:
   phproxy:
-    build: .
-    image: phproxy:local
-    container_name: phproxy
+    image: miglen/phproxy:latest
     ports:
-      - "8080:80"
-    # Bind-mount the source for development. Remove the `volumes:` block
-    # below to run with the image-baked code (production mode).
-    volumes:
-      - ./:/var/www/html
+      - "127.0.0.1:${PHPROXY_PORT:-8080}:80"
+    environment:
+      PHPROXY_PUBLIC_URL: ${PHPROXY_PUBLIC_URL:-}
+      PHPROXY_DIAGNOSTICS: ${PHPROXY_DIAGNOSTICS:-0}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+      - /var/run/apache2:rw,noexec,nosuid,size=1m
+      - /var/lock/apache2:rw,noexec,nosuid,size=1m
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
     restart: unless-stopped

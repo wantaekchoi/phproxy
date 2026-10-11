@@ -1,1 +1,3 @@
 files/php/misc.override.php
+.DS_Store
+.env

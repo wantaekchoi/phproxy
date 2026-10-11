@@ -1,21 +1,25 @@
 <?php
 
 /**
- * PHProxy v1.2.0
+ * PHProxy v1.4.0
  *
  * Single-file web HTTP/HTTPS proxy in PHP. Drop into any PHP 8.1+ web root
  * and open it — no dependencies, no build step, no `vendor/`, no `files/`
  * directory. Works under any filename (rename to proxy.php if you like).
  *
- * @version    v1.2.0
+ * @version    v1.4.0
  * @author     Miglen Evlogiev (revive), PhoenixPeca, Biojet1, Quix0r, dacendo
  * @copyright  2002-2007 A.A. (whitefyre); 2015-2019 contributors; 2025-2026 revive
  * @license    GNU GPL v3
  * @repo       https://github.com/PHProxy/phproxy
  */
 
-/* PRODUCTIVE: */ error_reporting(0);
-// DEVELOP: error_reporting(E_ALL); ini_set('display_errors', '1');
+// Loading the pure helpers for tests does not dispatch an HTTP request.
+if (defined('PHPROXY_LIBRARY_ONLY') && PHPROXY_LIBRARY_ONLY) return;
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
 
 // --- ASSET DISPATCHER --------------------------------------------------
 // Serves the proxy's own CSS via ?asset=<name>. Keeps the script
@@ -50,19 +54,28 @@ if (isset($_GET['asset'])) {
 //   }
 // Helper used by the new network-check APIs (dns / portcheck / cert).
 $phproxy_api_validate_host = function (string $host): bool {
-    if ($host === '' || strlen($host) > 253) return false;
-    if (!preg_match('/^[a-zA-Z0-9._:-]+$/', $host)) return false;
-    $block = '#^127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|^localhost$|^::1$|^0+\.0+\.0+\.0+$#i';
-    if (preg_match($block, $host)) return false;
-    return true;
+    try {
+        $host = phproxy_normalize_host($host);
+        return !filter_var($host, FILTER_VALIDATE_IP) || phproxy_is_public_ip($host);
+    } catch (Throwable $e) {
+        return false;
+    }
 };
+
+// Socket diagnostics are operator-only features; public images start with them disabled.
+if (in_array($_GET['api'] ?? '', ['portcheck', 'cert'], true) && getenv('PHPROXY_DIAGNOSTICS') !== '1') {
+    http_response_code(403);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => false, 'error' => 'Socket diagnostics are disabled by the operator']);
+    exit;
+}
 
 // --- DNS LOOKUP API (?api=dns&host=example.com&type=A) -----------------
 if (isset($_GET['api']) && $_GET['api'] === 'dns') {
     header('Content-Type: application/json; charset=utf-8');
     $host = (string) ($_GET['host'] ?? '');
     $type = strtoupper((string) ($_GET['type'] ?? 'A'));
-    if (!$phproxy_api_validate_host($host)) {
+    if (!phproxy_valid_dns_name($host)) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Invalid or blacklisted host']);
         exit;
@@ -79,7 +92,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'dns') {
         exit;
     }
     $started = microtime(true);
-    $records = @dns_get_record($host, $types[$type]);
+    $records = @dns_get_record(rtrim($host, '.') . '.', $types[$type]);
     $ms      = (int) ((microtime(true) - $started) * 1000);
     if ($records === false) {
         echo json_encode(['ok' => false, 'host' => $host, 'type' => $type, 'error' => 'Lookup failed', 'duration_ms' => $ms]);
@@ -90,7 +103,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'dns') {
 }
 
 // --- PORT CHECK API (?api=portcheck&host=example.com&port=443) ---------
-// `port` accepts a single port (443), an inclusive range (80-443) or a
+// `port` accepts a single port (443), an inclusive range (8000-8010) or a
 // comma-separated mix (22,80,443,8000-8010). Hard cap is 128 ports per
 // request; default per-port timeout is 1.0s, override with ?timeout=…
 // (clamped 0.1–5.0). Response always carries a `results` array.
@@ -109,12 +122,22 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
     $ports = phproxy_parse_port_spec($port_spec);
     if ($ports === false) {
         http_response_code(400);
-        echo json_encode(['ok' => false, 'error' => 'Invalid port spec. Examples: 443, 80-443, 22,80,443,8000-8010', 'received' => $port_spec]);
+        echo json_encode(['ok' => false, 'error' => 'Invalid port spec. Examples: 443, 8000-8010, 22,80,443,8000-8010', 'received' => $port_spec]);
         exit;
     }
     if (count($ports) > 128) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Too many ports requested (max 128)', 'requested' => count($ports)]);
+        exit;
+    }
+
+    $scan_deadline = microtime(true) + 10;
+    try {
+        $host = phproxy_normalize_host($host);
+        $scan_address = phproxy_resolve_public_host($host, $scan_deadline)[0];
+    } catch (Throwable $e) {
+        http_response_code($e instanceof InvalidArgumentException ? 400 : 502);
+        echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
         exit;
     }
 
@@ -146,7 +169,13 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
         foreach ($ports as $p) {
             if (connection_aborted()) break;
             $t0   = microtime(true);
-            $sock = @stream_socket_client("tcp://$host:$p", $errno, $errstr, $timeout);
+            if (microtime(true) >= $scan_deadline) break;
+            $errno = 0; $errstr = '';
+            try {
+                $sock = phproxy_open_public_socket($host, $p, false, min($scan_deadline, microtime(true) + $timeout), [], false, $scan_address);
+            } catch (Throwable $e) {
+                $sock = false; $errstr = $e->getMessage();
+            }
             $ms   = (int) ((microtime(true) - $t0) * 1000);
             if ($sock === false) {
                 $closed++;
@@ -159,6 +188,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
         }
         $emit([
             'event'       => 'end',
+            'complete'    => $open + $closed === count($ports),
             'open'        => $open,
             'closed'      => $closed,
             'duration_ms' => (int) ((microtime(true) - $scan_started) * 1000),
@@ -171,7 +201,13 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
     $results = [];
     foreach ($ports as $p) {
         $t0   = microtime(true);
-        $sock = @stream_socket_client("tcp://$host:$p", $errno, $errstr, $timeout);
+        if (microtime(true) >= $scan_deadline || connection_aborted()) break;
+        $errno = 0; $errstr = '';
+        try {
+            $sock = phproxy_open_public_socket($host, $p, false, min($scan_deadline, microtime(true) + $timeout), [], false, $scan_address);
+        } catch (Throwable $e) {
+            $sock = false; $errstr = $e->getMessage();
+        }
         $ms   = (int) ((microtime(true) - $t0) * 1000);
         if ($sock === false) {
             $results[] = ['port' => $p, 'reachable' => false, 'error' => $errstr ?: 'connect failed', 'errno' => (int) $errno, 'latency_ms' => $ms];
@@ -188,6 +224,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
         'host'         => $host,
         'port_spec'    => $port_spec,
         'count'        => count($results),
+        'complete'     => count($results) === count($ports),
         'open'         => $open,
         'closed'       => count($results) - $open,
         'timeout_s'    => $timeout,
@@ -201,7 +238,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'portcheck') {
  * Parse a port spec — single, range, or comma list — into a sorted,
  * deduped array of ints. Returns false on any syntax error or out-of-range.
  *   "443"            → [443]
- *   "80-443"         → [80, 81, …, 443]
+ *   "8000-8010"         → [80, 81, …, 443]
  *   "22,80,443"      → [22, 80, 443]
  *   "80,8000-8010"   → [80, 8000, …, 8010]
  */
@@ -215,9 +252,11 @@ function phproxy_parse_port_spec(string $spec): array|false
         if ($chunk === '') continue;
         if (strpos($chunk, '-') !== false) {
             $parts = explode('-', $chunk, 2);
+            if (!ctype_digit(trim($parts[0])) || !ctype_digit(trim($parts[1]))) return false;
             $a = (int) trim($parts[0]);
             $b = (int) trim($parts[1]);
             if ($a < 1 || $a > 65535 || $b < 1 || $b > 65535 || $b < $a) return false;
+            if ($b - $a + 1 > 128) return false;
             for ($i = $a; $i <= $b; $i++) $set[$i] = true;
         } else {
             if (!ctype_digit($chunk)) return false;
@@ -247,20 +286,17 @@ if (isset($_GET['api']) && $_GET['api'] === 'cert') {
         echo json_encode(['ok' => false, 'error' => 'Invalid port (1–65535)']);
         exit;
     }
-    // First handshake — let OpenSSL negotiate freely so we capture the
-    // server's preferred TLS version + cipher AND the peer cert chain.
-    $ctx = stream_context_create([
-        'ssl' => [
-            'capture_peer_cert'       => true,
-            'capture_peer_cert_chain' => true,
-            'verify_peer'             => false,
-            'verify_peer_name'        => false,
-            'SNI_enabled'             => true,
-            'peer_name'               => $host,
-        ],
-    ]);
     $started = microtime(true);
-    $sock    = @stream_socket_client("ssl://$host:$port", $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $ctx);
+    $cert_deadline = $started + 15;
+    $sock = false; $errno = 0; $errstr = '';
+    try {
+        $host = phproxy_normalize_host($host);
+        $cert_address = phproxy_resolve_public_host($host, $cert_deadline)[0];
+        $sock = phproxy_open_public_socket($host, $port, true, min($cert_deadline, microtime(true) + 10),
+            ['capture_peer_cert' => true, 'capture_peer_cert_chain' => true], true, $cert_address);
+    } catch (Throwable $e) {
+        $errstr = $e->getMessage();
+    }
     $ms      = (int) ((microtime(true) - $started) * 1000);
     if ($sock === false) {
         echo json_encode(['ok' => false, 'host' => $host, 'port' => $port, 'error' => $errstr ?: 'SSL handshake failed', 'errno' => (int) $errno, 'latency_ms' => $ms]);
@@ -379,17 +415,14 @@ if (isset($_GET['api']) && $_GET['api'] === 'cert') {
             $tls_results[] = ['version' => $label, 'supported' => false, 'error' => 'OpenSSL on this PHP build cannot speak ' . $label];
             continue;
         }
-        $pctx = stream_context_create([
-            'ssl' => [
-                'verify_peer'      => false,
-                'verify_peer_name' => false,
-                'SNI_enabled'      => true,
-                'peer_name'        => $host,
-                'crypto_method'    => $method,
-            ],
-        ]);
         $pt0 = microtime(true);
-        $psock = @stream_socket_client("ssl://$host:$port", $en, $es, 5, STREAM_CLIENT_CONNECT, $pctx);
+        $psock = false; $en = 0; $es = '';
+        try {
+            $psock = phproxy_open_public_socket($host, $port, true, min($cert_deadline, $pt0 + 3),
+                ['crypto_method' => $method], true, $cert_address);
+        } catch (Throwable $e) {
+            $es = $e->getMessage();
+        }
         $pms = (int) ((microtime(true) - $pt0) * 1000);
         if ($psock === false) {
             $tls_results[] = ['version' => $label, 'supported' => false, 'error' => $es ?: 'handshake refused', 'latency_ms' => $pms];
@@ -455,10 +488,11 @@ if (isset($_GET['api']) && $_GET['api'] === 'ipinfo') {
         foreach (explode(',', $xff_raw) as $h) {
             $h = trim($h);
             if ($h !== '' && filter_var($h, FILTER_VALIDATE_IP)) $xff_chain[] = $h;
+            if (count($xff_chain) >= 16) break;
         }
     }
-    // Prefer the first XFF entry (original client) when behind a reverse proxy.
-    $client_ip = !empty($xff_chain) ? $xff_chain[0] : $remote;
+    // Forwarded entries are untrusted informational data, never client identity.
+    $client_ip = $remote;
 
     // Server's own primary IP via gethostbyname(hostname). Often the
     // internal Docker IP — useful but not "what the internet sees".
@@ -469,27 +503,25 @@ if (isset($_GET['api']) && $_GET['api'] === 'ipinfo') {
         if ($resolved !== false && $resolved !== $hostname) $server_ip = $resolved;
     }
 
-    // Real outgoing IP — what the internet actually sees when this server
-    // makes outbound HTTP calls. UDP "connect" trick: no packets sent,
-    // but the kernel picks the outgoing interface so the local socket
-    // name gives us the right answer.
+    // Local interface selected for outbound traffic; NAT can change the public IP.
+    // UDP connect selects a route without sending a packet.
     $outgoing_ip = phproxy_outgoing_ip();
 
-    $shape = function (string $ip): array {
+    $shape = function (string $ip, bool $reverse = false): array {
         if ($ip === '') return ['ip' => ''];
-        $is_priv = !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        $is_priv = !phproxy_is_public_ip($ip);
         return [
             'ip'         => $ip,
             'family'     => str_contains($ip, ':') ? 'IPv6' : 'IPv4',
             'is_private' => (bool) $is_priv,
-            'reverse'    => $is_priv ? '' : (@gethostbyaddr($ip) ?: ''),
+            'reverse'    => !$reverse || $is_priv ? '' : (@gethostbyaddr($ip) ?: ''),
         ];
     };
 
     if ($custom_ip !== '') {
         echo json_encode([
             'ok'          => true,
-            'lookup'      => $shape($custom_ip),
+            'lookup'      => $shape($custom_ip, true),
             'duration_ms' => (int) ((microtime(true) - $started) * 1000),
         ], JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
         exit;
@@ -497,13 +529,13 @@ if (isset($_GET['api']) && $_GET['api'] === 'ipinfo') {
 
     echo json_encode([
         'ok'        => true,
-        'client'    => $shape($client_ip),
+        'client'    => $shape($client_ip, true),
         'server'    => $shape($server_ip),
         'outgoing'  => $shape($outgoing_ip),
         'forwarded' => array_map($shape, $xff_chain),
         'request'   => [
             'method'          => $_SERVER['REQUEST_METHOD']      ?? '',
-            'protocol'        => isset($_SERVER['HTTPS']) || ($_SERVER['SERVER_PORT'] ?? '') == '443' ? 'HTTPS' : 'HTTP',
+            'protocol'        => (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') || ($_SERVER['SERVER_PORT'] ?? '') == '443' ? 'HTTPS' : 'HTTP',
             'remote_addr'     => $remote,
             'host_header'     => $_SERVER['HTTP_HOST']            ?? '',
             'user_agent'      => $_SERVER['HTTP_USER_AGENT']      ?? '',
@@ -578,43 +610,48 @@ if (isset($_GET['api']) && $_GET['api'] === 'fetch') {
         exit;
     };
 
-    if ($_SERVER['REQUEST_METHOD'] !== 'POST') $api_json_err(405, 'POST required');
-    $raw_in = file_get_contents('php://input') ?: '';
-    $req_in = json_decode($raw_in, true);
-    if (!is_array($req_in) || empty($req_in['url'])) $api_json_err(400, 'Invalid JSON body or missing "url"');
-
-    // SSRF guard — refuse the same blacklisted host ranges the browser flow
-    // blocks (loopback / RFC1918). Replicate the regex here to fail fast.
-    $api_host_block = '#^127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|localhost$|^::1$#i';
-    $api_url_host = (string) (@parse_url((string) $req_in['url'], PHP_URL_HOST) ?: '');
-    if ($api_url_host === '' || preg_match($api_host_block, $api_url_host)) {
-        $api_json_err(400, 'Target host blacklisted or unparseable', ['host' => $api_url_host]);
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+        header('Allow: POST');
+        $api_json_err(405, 'POST required');
     }
+    if (strtolower(trim(explode(';', (string) ($_SERVER['CONTENT_TYPE'] ?? ''), 2)[0])) !== 'application/json') {
+        $api_json_err(415, 'Content-Type application/json required');
+    }
+    try {
+        $public_url = phproxy_public_script_url($_SERVER);
+    } catch (Throwable $e) {
+        $api_json_err(500, 'Invalid public URL configuration');
+    }
+    if (isset($_SERVER['HTTP_ORIGIN']) && !phproxy_api_origin_allowed((string) $_SERVER['HTTP_ORIGIN'], $public_url)) {
+        $api_json_err(403, 'Cross-origin API requests are not permitted');
+    }
+    $raw_in = file_get_contents('php://input', false, null, 0, 3 * 1024 * 1024 + 1);
+    if ($raw_in === false || strlen($raw_in) > 3 * 1024 * 1024) $api_json_err(413, 'JSON request exceeds 3 MiB');
+    $req_in = json_decode($raw_in, true, 32);
+    if (!is_array($req_in) || !is_string($req_in['url'] ?? null) || $req_in['url'] === '') $api_json_err(400, 'Invalid JSON body or missing "url"');
+    if (($req_in['verify_ssl'] ?? true) !== true) $api_json_err(400, 'TLS certificate verification cannot be disabled');
 
     $api_result = phproxy_api_fetch($req_in);
 
     if (($req_in['return'] ?? 'json') === 'raw') {
-        // Emit the upstream response verbatim. Drop hop-by-hop and encoding
-        // headers we've already decoded for the client.
-        if (isset($api_result['status'])) http_response_code($api_result['status']);
-        $first_ct = true;
-        foreach (($api_result['headers'] ?? []) as $hname => $hvalue) {
-            $lhname = strtolower($hname);
-            if (in_array($lhname, ['transfer-encoding', 'content-encoding', 'content-length', 'connection'], true)) continue;
-            // For Content-Type, replace any previous (default Apache sets one);
-            // for everything else, append.
-            $replace = ($lhname === 'content-type' && $first_ct);
-            header($hname . ': ' . $hvalue, $replace);
-            if ($lhname === 'content-type') $first_ct = false;
+        if (empty($api_result['ok'])) $api_json_err($api_result['http_status'] ?? 502, $api_result['error'] ?? 'Upstream request failed');
+        http_response_code($api_result['status']);
+        // Only representation headers belong on the proxy response. Never import
+        // upstream origin policy, cookies, redirects or authentication challenges.
+        foreach (['content-type', 'content-language', 'content-encoding'] as $name) {
+            if (isset($api_result['headers'][$name])) header($name . ': ' . $api_result['headers'][$name]);
         }
-        echo $api_result['body_raw'] ?? '';
+        phproxy_untrusted_response_headers(false);
+        echo $api_result['body_raw'];
         exit;
     }
 
     // JSON envelope. UTF-8 bodies go in directly, binary gets base64'd.
     header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (empty($api_result['ok'])) http_response_code($api_result['http_status'] ?? 502);
     $body_raw = $api_result['body_raw'] ?? '';
-    if ($body_raw !== '' && mb_check_encoding($body_raw, 'UTF-8')) {
+    if ($body_raw !== '' && preg_match('//u', $body_raw) === 1) {
         $api_result['body']          = $body_raw;
         $api_result['body_encoding'] = 'utf8';
     } else {
@@ -622,7 +659,7 @@ if (isset($_GET['api']) && $_GET['api'] === 'fetch') {
         $api_result['body_encoding'] = 'base64';
     }
     unset($api_result['body_raw']);
-    echo json_encode($api_result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    echo json_encode($api_result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     exit;
 }
 
@@ -637,7 +674,7 @@ $_config            =
                         'get_form_name'            => '_proxgfn',
                         'basic_auth_var_name'      => '_proxba',
                         'site_name'                => 'PHProxy',
-                        'max_file_size'            => -1,
+                        'max_file_size'            => 8388608,
                         'allow_hotlinking'         => 0,
                         'upon_hotlink'             => 1,
                         'compress_output'          => 0,
@@ -730,7 +767,7 @@ $_system            =
                         'ssl'          => extension_loaded('openssl') && version_compare(PHP_VERSION, '4.3.0', '>='),
                         'uploads'      => ini_get('file_uploads'),
                         'gzip'         => extension_loaded('zlib') && !ini_get('zlib.output_compression'),
-                        'stripslashes' => true,
+                        'stripslashes' => false,
                     ];
 $_proxify           =
                     [
@@ -739,14 +776,9 @@ $_proxify           =
                         'application/xhtml+xml' => 1,
                         'text/css'              => 1,
                     ];
-$_version           = 'v1.3.3';
-$_http_host         = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : 'localhost');
-// https://stackoverflow.com/questions/4504831/serverhttp-host-contains-port-number-too
-$pos = strpos($_http_host, ':');
-if ($pos) {
-    $_http_host = substr($_http_host, 0, $pos);
-}
-$_script_url        = 'http' . ((isset($_ENV['HTTPS']) && $_ENV['HTTPS'] == 'on') || $_SERVER['SERVER_PORT'] == 443 ? 's' : '') . '://' . $_http_host . ($_SERVER['SERVER_PORT'] != 80 && $_SERVER['SERVER_PORT'] != 443 ? ':' . $_SERVER['SERVER_PORT'] : '') . $_SERVER['PHP_SELF'];
+$_version           = 'v1.4.0';
+$_script_url        = phproxy_public_script_url($_SERVER);
+$_http_host         = (string) parse_url($_script_url, PHP_URL_HOST);
 $_script_base       = substr($_script_url, 0, strrpos($_script_url, '/')+1);
 $_url               = '';
 $_url_parts         = [];
@@ -770,11 +802,11 @@ $_basic_auth_header = '';
 $_basic_auth_realm  = '';
 $_auth_creds        = [];
 $_response_body     = '';
-$pos = isset($_COOKIE['userAgent']) ? $_COOKIE['userAgent'] : null;
+$pos = phproxy_user_agent_setting();
 if(!isset($pos) || $pos == ""){ // empty means old method
-  $_user_agent = isset($_SERVER['HTTP_X_IORG_FBS']) ? 'SamsungI8910/SymbianOS/6.1 PHProxy/'.$_version : $_SERVER['HTTP_USER_AGENT'];
+  $_user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'PHProxy/'.$_version;
 }else if($pos == '.'){ // dot means use the browsers UA
-  $_user_agent = $_SERVER['HTTP_USER_AGENT'];
+  $_user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'PHProxy/'.$_version;
 }else if($pos == '-'){ // dash means dont set UA
   $_user_agent = null;
 }else{
@@ -798,7 +830,7 @@ function show_report(array $data): void
 
 function add_cookie(string $name, mixed $value, int $expires = 0): string
 {
-    return rawurlencode(rawurlencode($name)) . '=' . rawurlencode(rawurlencode($value)) . (empty($expires) ? '' : '; expires=' . gmdate('D, d-M-Y H:i:s \G\M\T', $expires)) . '; path=/; domain=.' . $GLOBALS['_http_host'];
+    return rawurlencode(rawurlencode($name)) . '=' . rawurlencode(rawurlencode($value)) . (empty($expires) ? '' : '; expires=' . gmdate('D, d-M-Y H:i:s \G\M\T', $expires)) . '; Path=/; SameSite=Lax' . (phproxy_is_https() ? '; Secure' : '');
 }
 
 function set_post_vars(array $array, ?string $parent_key = null): array
@@ -969,44 +1001,225 @@ function phproxy_ua_presets(): array
  */
 function phproxy_panel_buckets(): array
 {
-    $settings = ['flags', 'userAgent', 'PHPSESSID', 'phproxy-theme', 'phproxy-seed', 'phproxy-seed-ttl', 'phproxy-seed-bits', 'phproxy-show-raw', 'phproxy-panel-tab'];
-    $visible  = [];
-    $headers  = [];
-    foreach (phproxy_raw_cookies() as $wire => $val) {
-        if (in_array($wire, $settings, true)) continue;
-        if (strpos($wire, 'hdr_') === 0) {
-            $headers[substr($wire, 4)] = rawurldecode($val);
-            continue;
+    $state = phproxy_state_snapshot();
+    $visible = $headers = $origins = [];
+    foreach ($state['phproxy_jar'] ?? [] as $id => $cookie) {
+        if ($cookie['expires'] !== 0 && $cookie['expires'] <= time()) continue;
+        $visible[$id] = $cookie + [
+            'display_name' => $cookie['name'], 'host' => $cookie['domain'],
+            'raw_name' => $id, 'raw_value' => $cookie['value'], 'is_proxy' => true,
+        ];
+    }
+    foreach ($state['phproxy_headers'] ?? [] as $name => $entry) {
+        $headers[$name] = $entry['value'];
+        $origins[$name] = $entry['origin'];
+    }
+    return ['cookies' => $visible, 'headers' => $headers, 'header_origins' => $origins];
+}
+
+function phproxy_public_script_url(array $server, ?string $configured = null): string
+{
+    $configured ??= (string) (getenv('PHPROXY_PUBLIC_URL') ?: '');
+    $script = (string) ($server['SCRIPT_NAME'] ?? '/index.php');
+    if (!preg_match('~^/[A-Za-z0-9_./%-]+$~D', $script)) $script = '/index.php';
+    if ($configured !== '') {
+        $p = parse_url($configured);
+        if ($p === false || !in_array(strtolower($p['scheme'] ?? ''), ['http', 'https'], true)
+            || empty($p['host']) || isset($p['user']) || isset($p['pass'])
+            || isset($p['query']) || isset($p['fragment']) || preg_match('/[\x00-\x20\x7f]/', $configured)) {
+            throw new RuntimeException('PHPROXY_PUBLIC_URL must be an absolute HTTP(S) URL without credentials, query or fragment.');
         }
-        $parsed = phproxy_decode_proxy_cookie_id($wire);
-        if ($parsed !== null) {
-            $v = phproxy_decode_proxy_cookie_value($val);
-            $visible[$wire] = [
-                'display_name' => $parsed['name'],
-                'host'         => ltrim($parsed['domain'], '.'),
-                'domain'       => $parsed['domain'],
-                'path'         => $parsed['path'],
-                'value'        => $v['value'],
-                'raw_value'    => $val,
-                'raw_name'     => $wire,
-                'secure'       => $v['secure'],
-                'is_proxy'     => true,
-            ];
-        } else {
-            $visible[$wire] = [
-                'display_name' => rawurldecode($wire),
-                'host'         => '',
-                'domain'       => '',
-                'path'         => '',
-                'value'        => rawurldecode($val),
-                'raw_value'    => $val,
-                'raw_name'     => $wire,
-                'secure'       => false,
-                'is_proxy'     => false,
-            ];
+        if (!isset($p['path']) || $p['path'] === '') return $configured . '/' . basename($script);
+        return $configured . (str_ends_with($p['path'], '/') ? basename($script) : '');
+    }
+    $authority = (string) ($server['HTTP_HOST'] ?? $server['SERVER_NAME'] ?? 'localhost');
+    if (!preg_match('/^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::[0-9]{1,5})?$/D', $authority)) $authority = 'localhost';
+    $https = (!empty($server['HTTPS']) && strtolower((string) $server['HTTPS']) !== 'off')
+        || (int) ($server['SERVER_PORT'] ?? 80) === 443;
+    return ($https ? 'https://' : 'http://') . $authority . $script;
+}
+
+function phproxy_is_https(): bool
+{
+    return strtolower((string) parse_url(phproxy_public_script_url($_SERVER), PHP_URL_SCHEME)) === 'https';
+}
+
+function phproxy_state_open(): void
+{
+    if (session_status() === PHP_SESSION_ACTIVE) return;
+    if (!session_start([
+        'use_strict_mode' => 1, 'use_only_cookies' => 1, 'cookie_lifetime' => 0,
+        'cookie_path' => '/', 'cookie_secure' => phproxy_is_https(),
+        'cookie_httponly' => true, 'cookie_samesite' => 'Lax', 'cache_limiter' => 'nocache',
+    ])) throw new RuntimeException('Unable to initialize private proxy session.');
+}
+
+function phproxy_state_close(): void
+{
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+}
+
+function phproxy_state_snapshot(): array
+{
+    phproxy_state_open();
+    $state = $_SESSION;
+    phproxy_state_close();
+    return $state;
+}
+
+function phproxy_csrf_token(): string
+{
+    if (isset($GLOBALS['_phproxy_csrf_cache'])) return $GLOBALS['_phproxy_csrf_cache'];
+    phproxy_state_open();
+    if (!isset($_SESSION['phproxy_csrf'])) $_SESSION['phproxy_csrf'] = bin2hex(random_bytes(32));
+    $token = $_SESSION['phproxy_csrf'];
+    phproxy_state_close();
+    $GLOBALS['_phproxy_csrf_cache'] = $token;
+    return $token;
+}
+
+function phproxy_csrf_valid(): bool
+{
+    $supplied = $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    $state = phproxy_state_snapshot();
+    return is_string($supplied) && isset($state['phproxy_csrf'])
+        && hash_equals($state['phproxy_csrf'], $supplied);
+}
+
+function phproxy_require_csrf(): void
+{
+    if (!phproxy_csrf_valid()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        exit('The form expired. Open the proxy home page and submit it again.');
+    }
+}
+
+function phproxy_user_agent_setting(): string
+{
+    return (string) (phproxy_state_snapshot()['phproxy_ua'] ?? '');
+}
+
+function phproxy_network_entries(): array
+{
+    return phproxy_state_snapshot()['phproxy_network'] ?? [];
+}
+
+function phproxy_trace_entries(): array
+{
+    return phproxy_state_snapshot()['phproxy_trace'] ?? [];
+}
+
+function phproxy_request_origin(string $url): string
+{
+    $p = parse_url($url);
+    if ($p === false || !in_array(strtolower($p['scheme'] ?? ''), ['http', 'https'], true)
+        || empty($p['host']) || isset($p['user']) || isset($p['pass'])
+        || preg_match('/[\x00-\x20\x7f]/', $url)) return '';
+    $scheme = strtolower($p['scheme']);
+    return $scheme . '://' . strtolower(rtrim($p['host'], '.')) . ':' . ($p['port'] ?? ($scheme === 'https' ? 443 : 80));
+}
+
+function phproxy_cookie_id(array $cookie): string
+{
+    return hash('sha256', $cookie['name'] . "\n" . $cookie['domain'] . "\n" . $cookie['path']);
+}
+
+function phproxy_cookie_domain_matches(string $host, string $domain, bool $hostOnly): bool
+{
+    $host = strtolower(rtrim($host, '.'));
+    $domain = strtolower(ltrim(rtrim($domain, '.'), '.'));
+    return $host === $domain || (!$hostOnly && !filter_var($host, FILTER_VALIDATE_IP)
+        && str_ends_with($host, '.' . $domain));
+}
+
+function phproxy_cookie_path_matches(string $path, string $cookiePath): bool
+{
+    return $path === $cookiePath || (str_starts_with($path, $cookiePath)
+        && (str_ends_with($cookiePath, '/') || substr($path, strlen($cookiePath), 1) === '/'));
+}
+
+function phproxy_cookie_parse(string $line, string $url, bool $sessionOnly, ?int $now = null): ?array
+{
+    $now ??= time();
+    $target = parse_url($url);
+    $host = strtolower(rtrim($target['host'] ?? '', '.'));
+    if ($host === '' || strlen($line) > 4096 || preg_match('/[\x00-\x1f\x7f]/', $line)) return null;
+    $parts = explode(';', $line);
+    $pair = explode('=', trim(array_shift($parts)), 2);
+    if (count($pair) !== 2 || !preg_match("/^[!#$%&'*+.^_\x60|~0-9A-Za-z-]+$/D", $pair[0])) return null;
+    $requestPath = $target['path'] ?? '/';
+    $slash = strrpos($requestPath, '/');
+    $defaultPath = $slash === false || $slash === 0 ? '/' : substr($requestPath, 0, $slash);
+    $cookie = ['name' => $pair[0], 'value' => $pair[1], 'domain' => $host, 'host_only' => true,
+        'path' => $defaultPath, 'secure' => false, 'httponly' => false, 'samesite' => '', 'expires' => 0];
+    $maxAge = null;
+    foreach ($parts as $part) {
+        [$key, $value] = array_pad(explode('=', trim($part), 2), 2, '');
+        $key = strtolower($key);
+        if ($key === 'domain') {
+            $domain = strtolower(ltrim(trim($value), '.'));
+            // Preserve same-host sessions, but deliberately narrow valid
+            // Domain cookies to their setting host without a suffix database.
+            if (!phproxy_cookie_domain_matches($host, $domain, false)) return null;
+            if (str_starts_with($cookie['name'], '__Host-')) return null;
+        } elseif ($key === 'path' && str_starts_with($value, '/')) {
+            $cookie['path'] = $value;
+        } elseif ($key === 'secure') {
+            $cookie['secure'] = true;
+        } elseif ($key === 'httponly') {
+            $cookie['httponly'] = true;
+        } elseif ($key === 'samesite' && in_array(strtolower($value), ['lax', 'strict', 'none'], true)) {
+            $cookie['samesite'] = ucfirst(strtolower($value));
+        } elseif ($key === 'max-age' && preg_match('/^-?[0-9]+$/D', $value)) {
+            $maxAge = (int) $value;
+        } elseif ($key === 'expires') {
+            $expires = strtotime($value);
+            if ($expires !== false) $cookie['expires'] = $expires === 0 ? 1 : $expires;
         }
     }
-    return ['cookies' => $visible, 'headers' => $headers];
+    if ($maxAge !== null) $cookie['expires'] = $maxAge <= 0 ? 1 : $now + min($maxAge, 31536000);
+    if ($sessionOnly && $cookie['expires'] > $now) $cookie['expires'] = 0;
+    if ($cookie['secure'] && strtolower($target['scheme'] ?? '') !== 'https') return null;
+    if (str_starts_with($cookie['name'], '__Secure-') && !$cookie['secure']) return null;
+    if (str_starts_with($cookie['name'], '__Host-') && (!$cookie['secure'] || $cookie['path'] !== '/')) return null;
+    return $cookie;
+}
+
+function phproxy_cookie_header(array $jar, string $url, bool $acceptCookies, ?int $now = null): string
+{
+    if (!$acceptCookies) return '';
+    $now ??= time();
+    $target = parse_url($url);
+    $matching = [];
+    foreach ($jar as $cookie) {
+        if (($cookie['expires'] !== 0 && $cookie['expires'] <= $now)
+            || ($cookie['secure'] && strtolower($target['scheme'] ?? '') !== 'https')
+            || !phproxy_cookie_domain_matches($target['host'] ?? '', $cookie['domain'], $cookie['host_only'])
+            || !phproxy_cookie_path_matches($target['path'] ?? '/', $cookie['path'])) continue;
+        $matching[] = $cookie;
+    }
+    usort($matching, fn($a, $b) => strlen($b['path']) <=> strlen($a['path']));
+    return implode('; ', array_map(fn($c) => $c['name'] . '=' . $c['value'], $matching));
+}
+
+function phproxy_store_cookies(array $lines, string $url, bool $acceptCookies, bool $sessionOnly): void
+{
+    if (!$acceptCookies) return;
+    phproxy_state_open();
+    $jar = $_SESSION['phproxy_jar'] ?? [];
+    foreach ($jar as $id => $cookie) {
+        if ($cookie['expires'] !== 0 && $cookie['expires'] <= time()) unset($jar[$id]);
+    }
+    foreach (array_slice($lines, 0, 100) as $line) {
+        $cookie = phproxy_cookie_parse($line, $url, $sessionOnly);
+        if ($cookie === null) continue;
+        $id = phproxy_cookie_id($cookie);
+        if ($cookie['expires'] !== 0 && $cookie['expires'] <= time()) unset($jar[$id]);
+        else $jar[$id] = $cookie;
+    }
+    $_SESSION['phproxy_jar'] = array_slice($jar, -100, null, true);
+    phproxy_state_close();
 }
 
 /**
@@ -1037,30 +1250,30 @@ function phproxy_seed_cipher(): string
 }
 
 /**
- * Master seed for URL encryption. Random bytes, lives for ttl seconds,
- * regenerates on access when missing/malformed. Stored base64 in the
- * phproxy-seed cookie. No external libs — pure PHP (random_bytes, hash,
- * hash_hmac, openssl_encrypt, all in core).
+ * URL keys stay server-side. Expiration is enforced here, independently
+ * of the browser; the per-request cache avoids session I/O per HTML link.
  */
 function phproxy_seed(): string
 {
-    $want_bytes = phproxy_seed_bits() / 8;
-    if (!empty($_COOKIE['phproxy-seed'])) {
-        $seed = base64_decode((string) $_COOKIE['phproxy-seed'], true);
-        if ($seed !== false && strlen($seed) === $want_bytes) {
-            return $seed;
-        }
+    $want_bytes = intdiv(phproxy_seed_bits(), 8);
+    $cached = $GLOBALS['_phproxy_seed_cache'] ?? null;
+    if (is_array($cached) && strlen($cached['key']) === $want_bytes && $cached['expires'] > time()) return $cached['key'];
+    phproxy_state_open();
+    $entry = $_SESSION['phproxy_seed'] ?? null;
+    if (!is_array($entry) || strlen($entry['key'] ?? '') !== $want_bytes || ($entry['expires'] ?? 0) <= time()) {
+        $entry = ['key' => random_bytes($want_bytes), 'expires' => time() + phproxy_seed_ttl()];
+        $_SESSION['phproxy_seed'] = $entry;
     }
-    $seed = random_bytes($want_bytes);
-    $b64  = base64_encode($seed);
-    setcookie('phproxy-seed', $b64, [
-        'expires'  => time() + phproxy_seed_ttl(),
-        'path'     => '/',
-        'samesite' => 'Lax',
-        'httponly' => false,
-    ]);
-    $_COOKIE['phproxy-seed'] = $b64;
-    return $seed;
+    phproxy_state_close();
+    $GLOBALS['_phproxy_seed_cache'] = $entry;
+    return $entry['key'];
+}
+
+function phproxy_seed_present(): bool
+{
+    $entry = phproxy_state_snapshot()['phproxy_seed'] ?? null;
+    return is_array($entry) && ($entry['expires'] ?? 0) > time()
+        && strlen($entry['key'] ?? '') === intdiv(phproxy_seed_bits(), 8);
 }
 
 /**
@@ -1093,11 +1306,12 @@ function phproxy_encrypt_url(string $url): string
  */
 function phproxy_decrypt_url(string $token): ?string
 {
-    if (empty($_COOKIE['phproxy-seed'])) return null;
     $bits = phproxy_seed_bits();
-    $klen = $bits / 8;
-    $seed = base64_decode((string) $_COOKIE['phproxy-seed'], true);
-    if ($seed === false || strlen($seed) !== $klen) return null;
+    $klen = intdiv($bits, 8);
+    $entry = $GLOBALS['_phproxy_seed_cache'] ?? (phproxy_state_snapshot()['phproxy_seed'] ?? null);
+    if (!is_array($entry) || ($entry['expires'] ?? 0) <= time() || strlen($entry['key'] ?? '') !== $klen) return null;
+    $seed = $entry['key'];
+    $GLOBALS['_phproxy_seed_cache'] = $entry;
 
     $b64 = strtr($token, '-_', '+/');
     $pad = strlen($b64) % 4;
@@ -1228,34 +1442,21 @@ function complete_url(string $url, bool $proxify = true): string
 
 function proxify_inline_css(string $css): string
 {
-    preg_match_all('#url\s*\(\s*(.+?(?=\)[f;,}!\s*]))\)#i', $css, $matches, PREG_SET_ORDER);
-
-    for ($i = 0, $count = count($matches); $i < $count; ++$i) {
-        $css = str_replace($matches[$i][0], 'url(' . proxify_css_url($matches[$i][1]) . ')', $css);
-    }
-
-    return $css;
+    return preg_replace_callback(
+        '~url\s*\(\s*((?:"[^"]*"|\'[^\']*\'|[^)]*))\s*\)~i',
+        fn($m) => 'url(' . proxify_css_url(trim($m[1])) . ')',
+        $css
+    ) ?? $css;
 }
 
 function proxify_css(string $css): string
 {
     $css = proxify_inline_css($css);
-
-    preg_match_all("#@import\s*(?:\"([^\">]*)\"?|'([^'>]*)'?)([^;]*)(;|$)#i", $css, $matches, PREG_SET_ORDER);
-
-    for ($i = 0, $count = count($matches); $i < $count; ++$i) {
-        $delim = '"';
-        $url   = $matches[$i][2];
-
-        if (isset($matches[$i][3])) {
-            $delim = "'";
-            $url   = $matches[$i][3];
-        }
-
-        $css = str_replace($matches[$i][0], '@import ' . $delim . proxify_css_url($matches[$i][1]) . $delim . (isset($matches[$i][4]) ? $matches[$i][4] : ''), $css);
-    }
-
-    return $css;
+    return preg_replace_callback(
+        '~(@import\s+)(["\'])([^"\']*)\2([^;]*)(;|$)~i',
+        fn($m) => $m[1] . $m[2] . complete_url($m[3]) . $m[2] . $m[4] . $m[5],
+        $css
+    ) ?? $css;
 }
 
 function proxify_css_url(string $url): string
@@ -1321,252 +1522,156 @@ function decode_url(string $url): string
     return str_replace(['&amp;', '&#38;'], '&', $url);
 }
 
-//
-// ACTION DISPATCHER (Cookies / Headers / User-Agent management)
-// All POSTs to ?action=… are handled here and redirect back to the entry form.
-//
-if (isset($_GET['action']) && $_SERVER['REQUEST_METHOD'] === 'POST')
+// Settings and upstream credentials belong to the private server session.
+function phproxy_setting_cookie(string $name, string $value, int $expires = 0): void
 {
-    $_action   = $_GET['action'];
-    $_settings = ['flags', 'userAgent', 'PHPSESSID', 'phproxy-theme', 'phproxy-seed', 'phproxy-seed-ttl', 'phproxy-seed-bits'];
+    setcookie($name, $value, ['expires' => $expires, 'path' => '/', 'secure' => phproxy_is_https(),
+        'httponly' => true, 'samesite' => 'Lax']);
+    if ($expires !== 0 && $expires < time()) unset($_COOKIE[$name]);
+    else $_COOKIE[$name] = $value;
+}
 
-    // Expire a cookie by its exact wire-form name. Uses setrawcookie() so PHP
-    // doesn't URL-encode the name again — important for proxy-stored cookies
-    // whose wire form is already double-rawurlencoded (e.g.
-    // "COOKIE%253B...%253B.host.com").
-    $_expire_raw = function ($wire_name) use ($_http_host) {
-        $expired = 'Thu, 01 Jan 1970 00:00:01 GMT';
-        $headers = [
-            $wire_name . "=; expires={$expired}; Max-Age=0; path=/",
-            $wire_name . "=; expires={$expired}; Max-Age=0; path=/; domain=." . $_http_host,
-            $wire_name . "=; expires={$expired}; Max-Age=0; path=/; domain=" . $_http_host,
-        ];
-        foreach ($headers as $h) header('Set-Cookie: ' . $h, false);
-    };
+function phproxy_custom_header_allowed(string $name, string $value): bool
+{
+    return strlen($name) <= 128 && strlen($value) <= 8192
+        && preg_match('/^[A-Za-z0-9-]+$/D', $name)
+        && !preg_match('/[\x00-\x1f\x7f]/', $value)
+        && !in_array(strtolower($name), ['host', 'connection', 'content-length', 'transfer-encoding',
+            'cookie', 'expect', 'upgrade', 'trailer', 'te', 'proxy-authorization'], true);
+}
 
-    $_raw_cookies = phproxy_raw_cookies();
+// Retire v1.3 client-side credentials; they are intentionally not imported.
+foreach (phproxy_raw_cookies() as $_old_name => $_old_value) {
+    $_decoded_name = rawurldecode(rawurldecode($_old_name));
+    if ($_old_name === 'phproxy-seed' || $_old_name === 'userAgent'
+        || str_starts_with($_old_name, 'hdr_') || str_starts_with($_decoded_name, 'COOKIE;')
+        || str_starts_with($_decoded_name, 'AUTH;')) {
+        if (preg_match('/^[A-Za-z0-9_%.-]+$/D', $_old_name)) {
+            foreach (['', $_http_host] as $_old_domain) {
+                $options = ['expires' => 1, 'path' => '/', 'secure' => phproxy_is_https(), 'httponly' => true, 'samesite' => 'Lax'];
+                if ($_old_domain !== '' && !filter_var($_old_domain, FILTER_VALIDATE_IP)) $options['domain'] = $_old_domain;
+                setrawcookie($_old_name, '', $options);
+            }
+        }
+    }
+}
+
+if (isset($_GET['action']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    phproxy_require_csrf();
+    $_action = is_string($_GET['action']) ? $_GET['action'] : '';
     $_redirect_tab = '';
-
-    switch ($_action)
-    {
+    phproxy_state_open();
+    switch ($_action) {
+        case 'clear-network':
+            $_SESSION['phproxy_network'] = [];
+            $_SESSION['phproxy_trace'] = [];
+            $_redirect_tab = 'network';
+            break;
         case 'clear-cookies':
-            foreach ($_raw_cookies as $_ck => $_cv) {
-                if (in_array($_ck, $_settings, true)) continue;
-                if (strpos($_ck, 'hdr_') === 0) continue;
-                $_expire_raw($_ck);
-            }
+            $_SESSION['phproxy_jar'] = [];
+            $_SESSION['phproxy_auth'] = [];
             $_redirect_tab = 'cookies';
             break;
-
         case 'delete-cookie':
-            // $_POST['name'] is the wire-form name as the browser stored it.
-            $_name = isset($_POST['name']) ? (string) $_POST['name'] : '';
-            if ($_name !== ''
-                && !in_array($_name, $_settings, true)
-                && strpos($_name, 'hdr_') !== 0
-                && strpbrk($_name, "\r\n") === false)
-            {
-                $_expire_raw($_name);
-            }
+            unset($_SESSION['phproxy_jar'][(string) ($_POST['name'] ?? '')]);
             $_redirect_tab = 'cookies';
             break;
-
         case 'add-cookie':
         case 'edit-cookie':
-            // For edit, $_POST['name'] carries the old wire-form name to be expired.
-            if ($_action === 'edit-cookie') {
-                $_old = isset($_POST['name']) ? (string) $_POST['name'] : '';
-                if ($_old !== '' && !in_array($_old, $_settings, true) && strpos($_old, 'hdr_') !== 0 && strpbrk($_old, "\r\n") === false) {
-                    $_expire_raw($_old);
+            $_n = trim((string) ($_POST['cookieName'] ?? ''));
+            $_v = (string) ($_POST['cookieValue'] ?? '');
+            $_d = strtolower(ltrim(trim((string) ($_POST['cookieDomain'] ?? '')), '.'));
+            $_p = (string) ($_POST['cookiePath'] ?? '/');
+            $_days = max(0, min(3650, (int) ($_POST['cookieExpires'] ?? 0)));
+            $_valid_host = filter_var($_d, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) || filter_var($_d, FILTER_VALIDATE_IP);
+            if ($_valid_host && !str_contains($_v, ';') && !str_contains($_p, ';')
+                && !preg_match('/[\x00-\x20\x7f]/', $_d . $_p) && str_starts_with($_p, '/')) {
+                $_manual_url = 'https://' . (str_contains($_d, ':') ? '[' . $_d . ']' : $_d) . $_p;
+                $_line = $_n . '=' . $_v . '; Path=' . $_p
+                    . (!empty($_POST['cookieSecure']) ? '; Secure' : '')
+                    . (!empty($_POST['cookieHttpOnly']) ? '; HttpOnly' : '')
+                    . ($_days > 0 ? '; Max-Age=' . ($_days * 86400) : '');
+                $_manual_cookie = phproxy_cookie_parse($_line, $_manual_url, false);
+                if ($_manual_cookie !== null) {
+                    $_ss = ucfirst(strtolower((string) ($_POST['cookieSameSite'] ?? '')));
+                    $_manual_cookie['samesite'] = in_array($_ss, ['Lax', 'Strict', 'None'], true) ? $_ss : '';
+                    if ($_action === 'edit-cookie') unset($_SESSION['phproxy_jar'][(string) ($_POST['name'] ?? '')]);
+                    $_SESSION['phproxy_jar'][phproxy_cookie_id($_manual_cookie)] = $_manual_cookie;
+                    $_SESSION['phproxy_jar'] = array_slice($_SESSION['phproxy_jar'], -100, null, true);
                 }
             }
-
-            $_n        = isset($_POST['cookieName'])    ? trim((string) $_POST['cookieName']) : '';
-            $_v        = isset($_POST['cookieValue'])   ? (string) $_POST['cookieValue']  : '';
-            $_d        = isset($_POST['cookieDomain'])  ? (string) $_POST['cookieDomain'] : '';
-            $_p        = isset($_POST['cookiePath'])    ? (string) $_POST['cookiePath']   : '/';
-            $_days     = isset($_POST['cookieExpires']) ? (int) $_POST['cookieExpires']   : 30;
-            $_secure   = !empty($_POST['cookieSecure']);
-            $_httponly = !empty($_POST['cookieHttpOnly']);
-            $_ss_in    = isset($_POST['cookieSameSite']) ? (string) $_POST['cookieSameSite'] : '';
-            $_samesite = in_array($_ss_in, ['Lax', 'Strict', 'None'], true) ? $_ss_in : '';
-
-            if ($_n === '' || in_array($_n, $_settings, true) || strpos($_n, 'hdr_') === 0 || strpbrk($_n . $_v . $_d . $_p, "\r\n") !== false) {
-                $_redirect_tab = 'cookies';
-                break;
-            }
-
-            $_treat_as_proxy = $_d !== '';  // Cookie targets a specific host → store in proxy COOKIE; format
-
-            if ($_treat_as_proxy) {
-                // Re-encode as COOKIE;name;path;domain (the format the proxy's outbound
-                // cookie forwarder looks for) using setrawcookie so the double-encoded
-                // name lands on the wire matching what the browser will read back.
-                $_id_plain  = 'COOKIE;' . $_n . ';' . $_p . ';' . $_d;
-                $_val_plain = $_v . ';' . ($_secure ? 'secure' : '');
-                $_wire_name = rawurlencode(rawurlencode($_id_plain));
-                $_wire_val  = rawurlencode(rawurlencode($_val_plain));
-                $_opts = [
-                    'path'     => '/',
-                    'domain'   => '.' . $_http_host,
-                    'secure'   => false,
-                    'httponly' => $_httponly,
-                ];
-                if ($_days > 0) $_opts['expires'] = time() + $_days * 86400;
-                if ($_samesite !== '') $_opts['samesite'] = $_samesite;
-                @setrawcookie($_wire_name, $_wire_val, $_opts);
-            } else {
-                $_opts = [
-                    'path'     => $_p !== '' ? $_p : '/',
-                    'secure'   => $_secure,
-                    'httponly' => $_httponly,
-                ];
-                if ($_days > 0) $_opts['expires'] = time() + $_days * 86400;
-                if ($_samesite !== '') $_opts['samesite'] = $_samesite;
-                @setcookie($_n, $_v, $_opts);
-            }
             $_redirect_tab = 'cookies';
             break;
-
         case 'add-header':
-            $_name  = isset($_POST['headerAddName']) ? trim((string) $_POST['headerAddName']) : '';
-            $_value = isset($_POST['headerAddValue']) ? (string) $_POST['headerAddValue'] : '';
-            if (preg_match('/^[A-Za-z0-9-]+$/', $_name) && strpbrk($_value, "\r\n") === false) {
-                setcookie('hdr_' . $_name, $_value, time() + 86400 * 365, '/');
-            }
-            $_redirect_tab = 'headers';
-            break;
-
         case 'edit-header':
-            // Rename + re-value: expire old, set new
-            $_old = isset($_POST['oldName']) ? (string) $_POST['oldName'] : '';
-            $_new = isset($_POST['headerName']) ? trim((string) $_POST['headerName']) : '';
-            $_val = isset($_POST['headerValue']) ? (string) $_POST['headerValue'] : '';
-            if (preg_match('/^[A-Za-z0-9-]+$/', $_old)) {
-                setcookie('hdr_' . $_old, '', time() - 3600, '/');
-            }
-            if (preg_match('/^[A-Za-z0-9-]+$/', $_new) && strpbrk($_val, "\r\n") === false) {
-                setcookie('hdr_' . $_new, $_val, time() + 86400 * 365, '/');
+            $_name = trim((string) ($_POST[$_action === 'add-header' ? 'headerAddName' : 'headerName'] ?? ''));
+            $_value = (string) ($_POST[$_action === 'add-header' ? 'headerAddValue' : 'headerValue'] ?? '');
+            $_origin = phproxy_request_origin((string) ($_POST['headerOrigin'] ?? ''));
+            if ($_origin !== '' && phproxy_custom_header_allowed($_name, $_value)) {
+                $_old = strtolower((string) ($_POST['oldName'] ?? $_name));
+                foreach (array_keys($_SESSION['phproxy_headers'] ?? []) as $_saved_name) {
+                    if (in_array(strtolower($_saved_name), [$_old, strtolower($_name)], true)) unset($_SESSION['phproxy_headers'][$_saved_name]);
+                }
+                $_SESSION['phproxy_headers'][$_name] = ['value' => $_value, 'origin' => $_origin];
+                $_SESSION['phproxy_headers'] = array_slice($_SESSION['phproxy_headers'], -40, null, true);
             }
             $_redirect_tab = 'headers';
             break;
-
         case 'delete-header':
-            $_name = isset($_POST['name']) ? (string) $_POST['name'] : '';
-            if (preg_match('/^[A-Za-z0-9-]+$/', $_name)) {
-                setcookie('hdr_' . $_name, '', time() - 3600, '/');
-            }
+            unset($_SESSION['phproxy_headers'][(string) ($_POST['name'] ?? '')]);
             $_redirect_tab = 'headers';
             break;
-
         case 'set-ua':
-            $_ua = isset($_POST['userAgent']) ? (string) $_POST['userAgent'] : '';
-            if (strpbrk($_ua, "\r\n") === false) {
-                setcookie('userAgent', $_ua, time() + 86400 * 365, '/');
-            }
+            $_ua = (string) ($_POST['userAgent'] ?? '');
+            if (strlen($_ua) <= 2048 && !preg_match('/[\x00-\x1f\x7f]/', $_ua)) $_SESSION['phproxy_ua'] = $_ua;
             $_redirect_tab = 'headers';
             break;
-
         case 'toggle-raw':
-            $_now = !empty($_COOKIE['phproxy-show-raw']);
-            if ($_now) {
-                setcookie('phproxy-show-raw', '', time() - 3600, '/');
-            } else {
-                setcookie('phproxy-show-raw', '1', time() + 86400 * 365, '/');
-            }
+            phproxy_setting_cookie('phproxy-show-raw', empty($_COOKIE['phproxy-show-raw']) ? '1' : '', time() + 31536000);
             $_redirect_tab = 'cookies';
             break;
-
         case 'rotate-seed':
-            // Force a new seed on the next phproxy_seed() call by clearing the cookie
-            setcookie('phproxy-seed', '', time() - 3600, '/');
-            unset($_COOKIE['phproxy-seed']);
+            unset($_SESSION['phproxy_seed'], $GLOBALS['_phproxy_seed_cache']);
             $_redirect_tab = 'options';
             break;
-
         case 'set-seed-ttl':
-            $_ttl = isset($_POST['seedTtl']) ? (int) $_POST['seedTtl'] : 3600;
-            if ($_ttl < 60)        $_ttl = 60;
-            if ($_ttl > 86400 * 7) $_ttl = 86400 * 7;
-            setcookie('phproxy-seed-ttl', (string) $_ttl, time() + 86400 * 365, '/');
-            // Also force seed rotation so the new TTL takes effect on the next encode
-            setcookie('phproxy-seed', '', time() - 3600, '/');
-            unset($_COOKIE['phproxy-seed']);
+            phproxy_setting_cookie('phproxy-seed-ttl', (string) max(60, min(604800, (int) ($_POST['seedTtl'] ?? 3600))), time() + 31536000);
+            unset($_SESSION['phproxy_seed'], $GLOBALS['_phproxy_seed_cache']);
             $_redirect_tab = 'options';
             break;
-
         case 'set-seed-bits':
-            $_bits = isset($_POST['seedBits']) ? (int) $_POST['seedBits'] : 256;
-            if (!in_array($_bits, [128, 192, 256], true)) $_bits = 256;
-            setcookie('phproxy-seed-bits', (string) $_bits, time() + 86400 * 365, '/');
-            // Key length changed → existing seed length no longer matches; rotate
-            setcookie('phproxy-seed', '', time() - 3600, '/');
-            unset($_COOKIE['phproxy-seed']);
+            $_bits = (int) ($_POST['seedBits'] ?? 256);
+            phproxy_setting_cookie('phproxy-seed-bits', (string) (in_array($_bits, [128, 192, 256], true) ? $_bits : 256), time() + 31536000);
+            unset($_SESSION['phproxy_seed'], $GLOBALS['_phproxy_seed_cache']);
             $_redirect_tab = 'options';
             break;
-
-        default:
-            // Unknown action — just bounce to entry form
-            break;
     }
-
-    // Honor return_to so saves inside the inline panel on a proxied page
-    // don't bounce the user back to the entry form. Only same-origin URLs
-    // (must start with $_script_base) are accepted, to prevent open-redirect.
-    $_rt = isset($_POST['return_to']) ? (string) $_POST['return_to'] : '';
-    if ($_rt !== '' && strpos($_rt, $_script_base) === 0) {
-        // Set a short-lived hint cookie so the injected panel re-opens on the
-        // same tab the user just edited
-        if ($_redirect_tab !== '') {
-            setcookie('phproxy-panel-tab', $_redirect_tab, time() + 60, '/');
-        }
-        $_dest = $_rt;
-    } else {
-        $_dest = $_script_url . ($_redirect_tab !== '' ? '?tab=' . $_redirect_tab : '');
-    }
-    header('Location: ' . $_dest);
-    exit(0);
+    phproxy_state_close();
+    // Return to the trusted browsing shell when its signed management form
+    // supplied a local context. Always re-encode after seed changes.
+    $_return_target = phproxy_browsing_return(
+        is_string($_POST['return_to'] ?? null) ? $_POST['return_to'] : '',
+        is_string($_POST['return_url'] ?? null) ? $_POST['return_url'] : '',
+        $_redirect_tab
+    );
+    header('Location: ' . ($_return_target ?? ($_script_url . ($_redirect_tab !== '' ? '?tab=' . $_redirect_tab : ''))), true, 303);
+    exit;
 }
 
-// Start a session for the Network tab log. Done after the early-exit
-// dispatchers so asset/api/action requests don't pay the session cost.
-if (session_status() === PHP_SESSION_NONE) {
-    @session_start([
-        'cookie_lifetime' => 0,
-        'cookie_samesite' => 'Lax',
-        'cookie_httponly' => false,
-    ]);
-}
-if (!isset($_SESSION['phproxy_network']) || !is_array($_SESSION['phproxy_network'])) {
-    $_SESSION['phproxy_network'] = [];
-}
-
-// Clear-network action handler (lives outside the main dispatcher so it can
-// touch $_SESSION, which only just opened).
-if (isset($_GET['action']) && $_GET['action'] === 'clear-network' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $_SESSION['phproxy_network'] = [];
-    $_rt = isset($_POST['return_to']) ? (string) $_POST['return_to'] : '';
-    if ($_rt !== '' && strpos($_rt, $_script_base) === 0) {
-        setcookie('phproxy-panel-tab', 'network', time() + 60, '/');
-        header('Location: ' . $_rt);
-    } else {
-        header('Location: ' . $_script_url);
-    }
-    exit(0);
-}
-
-//
-// Legacy /edit.php compatibility — accepts the old userAgent POST shape
-// from any caller that still wires forms to action=submit&userAgent=…
-// (bare GET to /edit.php now 404s; that path is no longer rewritten).
-if (isset($_POST['action']) && $_POST['action'] === 'submit' && isset($_POST['userAgent']) && !isset($_GET['action']))
-{
+if (isset($_POST['action']) && $_POST['action'] === 'submit' && isset($_POST['userAgent']) && !isset($_GET['action'])) {
+    phproxy_require_csrf();
     $_ua_legacy = (string) $_POST['userAgent'];
-    if (strpbrk($_ua_legacy, "\r\n") === false) {
-        setcookie('userAgent', $_ua_legacy, time() + 86400 * 365, '/');
+    if (strlen($_ua_legacy) <= 2048 && !preg_match('/[\x00-\x1f\x7f]/', $_ua_legacy)) {
+        phproxy_state_open();
+        $_SESSION['phproxy_ua'] = $_ua_legacy;
+        phproxy_state_close();
     }
     header('Location: ' . $_script_url);
-    exit(0);
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST[$_config['url_var_name']]) && !isset($_GET[$_config['url_var_name']])) {
+    phproxy_require_csrf();
 }
 
 // URL encoding radio (Options tab) → maps a single radio value back onto
@@ -1597,20 +1702,16 @@ if (isset($_POST[$_config['url_var_name']]) && !isset($_GET[$_config['url_var_na
     }
 
     $_iflags = base_convert(($_iflags != '' ? $_iflags : '0'), 2, 16);
+    phproxy_setting_cookie('flags', $_iflags, time() + 2419200);
 }
-else if (isset($_GET[$_config['flags_var_name']]) && !isset($_GET[$_config['get_form_name']]) && ctype_alnum($_GET[$_config['flags_var_name']]))
-{
-    $_iflags = $_GET[$_config['flags_var_name']];
-}
-else if (isset($_COOKIE['flags']) && ctype_alnum($_COOKIE['flags']))
+else if (isset($_COOKIE['flags']) && is_string($_COOKIE['flags']) && preg_match('/^[a-f0-9]{1,5}$/iD', $_COOKIE['flags']))
 {
     $_iflags = $_COOKIE['flags'];
 }
 
 if ($_iflags !== '')
 {
-    $_set_cookie[] = add_cookie('flags', $_iflags, time()+2419200);
-    $_iflags = str_pad(base_convert($_iflags, 16, 2), count($_flags), '0', STR_PAD_LEFT);
+    $_iflags = substr(str_pad(base_convert($_iflags, 16, 2), count($_flags), '0', STR_PAD_LEFT), -count($_flags));
     $i = 0;
 
     foreach ($_flags as $flag_name => $flag_value)
@@ -1651,6 +1752,21 @@ if ($_system['stripslashes'])
 // "http:/target" (single slash) and restore "http://target".
 //
 
+// Browsing-bar navigation has its own token: upstream HTML never receives
+// the CSRF token that authorizes cookie, credential or settings changes.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['phproxy_browse_url'])
+    && !isset($_GET[$_config['url_var_name']])) {
+    if (!is_string($_POST['phproxy_navigation_token'] ?? null)
+        || !hash_equals(phproxy_navigation_token(), $_POST['phproxy_navigation_token'])) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        exit('Navigation expired. Open PHProxy home and try again.');
+    }
+    $_browse_url = is_string($_POST['phproxy_browse_url']) ? trim($_POST['phproxy_browse_url']) : '';
+    header('Location: ' . $_script_url . ($_browse_url !== '' ? '?' . $_config['url_var_name'] . '=' . encode_url($_browse_url) : ''), true, 303);
+    exit;
+}
+
 if (!isset($_POST[$_config['url_var_name']])
     && !isset($_GET[$_config['url_var_name']])
     && !isset($_GET[$_config['get_form_name']])
@@ -1670,7 +1786,9 @@ if (!isset($_POST[$_config['url_var_name']])
 
 if (isset($_POST[$_config['url_var_name']]) && !isset($_GET[$_config['url_var_name']]))
 {
-    header('Location: ' . $_script_url . '?' . $_config['url_var_name'] . '=' . encode_url($_POST[$_config['url_var_name']]) . '&' . $_config['flags_var_name'] . '=' . base_convert($_iflags, 2, 16));
+    $_submitted_url = trim((string) $_POST[$_config['url_var_name']]);
+    $_panel_hint = ($_POST['phproxy_panel_context'] ?? '') === '1' && $_submitted_url !== '' ? '&panel=options' : '';
+    header('Location: ' . $_script_url . ($_submitted_url !== '' ? '?' . $_config['url_var_name'] . '=' . encode_url($_submitted_url) : '') . $_panel_hint, true, 303);
     exit(0);
 }
 
@@ -1701,405 +1819,24 @@ $_url = strip_tracking_params($_url);
 
 if (isset($_GET[$_config['url_var_name']], $_POST[$_config['basic_auth_var_name']], $_POST['username'], $_POST['password']))
 {
+    phproxy_require_csrf();
     $_request_method    = 'GET';
     $_basic_auth_realm  = base64_decode($_POST[$_config['basic_auth_var_name']]);
     $_basic_auth_header = base64_encode($_POST['username'] . ':' . $_POST['password']);
 }
 
 //
-// SET URL
+// SET URL — the shared parser and transport own destination validation.
 //
-
-if (strpos($_url, '://') === false)
-{
-    $_url = 'http://' . $_url;
-}
-
-if (url_parse($_url, $_url_parts))
-{
+if (strpos($_url, '://') === false) $_url = 'http://' . $_url;
+try {
+    $_target = phproxy_parse_http_url($_url);
+    $_url = $_target['scheme'] . '://' . $_target['authority'] . $_target['path'];
+    if (!url_parse($_url, $_url_parts)) throw new InvalidArgumentException('Invalid URL');
     $_base = $_url_parts;
-
-    if (!empty($_hosts))
-    {
-        foreach ($_hosts as $host)
-        {
-            if (preg_match($host, $_url_parts['host']))
-            {
-                show_report(['which' => 'index', 'category' => 'error', 'group' => 'url', 'type' => 'external', 'error' => 1]);
-            }
-        }
-    }
-}
-else
-{
+} catch (Throwable $e) {
     show_report(['which' => 'index', 'category' => 'error', 'group' => 'url', 'type' => 'external', 'error' => 2]);
 }
-
-
-	/*
-	* Check if the hostname is valid otherwise try to convert to idna
-	*/
-	$chars = str_split($_url_parts['host']);
-	foreach($chars as $char){
-		if(ord($char)>122){
-/**
- * A Bootstring encoding of Unicode for Internationalized Domain Names in Applications (IDNA) for PHP
- * Punycode implementation as described in RFC 3492
- *
- * @link http://tools.ietf.org/html/rfc3492
- * @repo https://github.com/true/php-punycode
- *
- *  LICENSE
- * 	Copyright (c) 2014 TrueServer B.V.
- *
- * 	Permission is hereby granted, free of charge, to any person obtaining a copy
- * 	of this software and associated documentation files (the "Software"), to deal
- *	in the Software without restriction, including without limitation the rights
- * 	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * 	copies of the Software, and to permit persons to whom the Software is furnished
- *	to do so, subject to the following conditions:
- * 
- * 	The above copyright notice and this permission notice shall be included in all
- *	copies or substantial portions of the Software.
- * 
- * 	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * 	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * 	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- *	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- *	THE SOFTWARE.
- *
- */
-class php_idna
-{
-
-    /**
-     * Bootstring parameter values
-     *
-     */
-    const BASE         = 36;
-    const TMIN         = 1;
-    const TMAX         = 26;
-    const SKEW         = 38;
-    const DAMP         = 700;
-    const INITIAL_BIAS = 72;
-    const INITIAL_N    = 128;
-    const PREFIX       = 'xn--';
-    const DELIMITER    = '-';
-
-    /**
-     * Encode table
-     *
-     * @param array
-     */
-    protected static $encodeTable = array(
-        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
-        'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x',
-        'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    );
-
-    /**
-     * Decode table
-     *
-     * @param array
-     */
-    protected static $decodeTable = array(
-        'a' =>  0, 'b' =>  1, 'c' =>  2, 'd' =>  3, 'e' =>  4, 'f' =>  5,
-        'g' =>  6, 'h' =>  7, 'i' =>  8, 'j' =>  9, 'k' => 10, 'l' => 11,
-        'm' => 12, 'n' => 13, 'o' => 14, 'p' => 15, 'q' => 16, 'r' => 17,
-        's' => 18, 't' => 19, 'u' => 20, 'v' => 21, 'w' => 22, 'x' => 23,
-        'y' => 24, 'z' => 25, '0' => 26, '1' => 27, '2' => 28, '3' => 29,
-        '4' => 30, '5' => 31, '6' => 32, '7' => 33, '8' => 34, '9' => 35
-    );
-
-    /**
-     * Character encoding
-     *
-     * @param string
-     */
-    protected $encoding;
-
-    /**
-     * Constructor
-     *
-     * @param string $encoding Character encoding
-     */
-    public function __construct($encoding = 'UTF-8')
-    {
-        $this->encoding = $encoding;
-    }
-
-    /**
-     * Encode a domain to its Punycode version
-     *
-     * @param string $input Domain name in Unicode to be encoded
-     * @return string Punycode representation in ASCII
-     */
-    public function encode($input)
-    {
-        $parts = explode('.', $input);
-        foreach ($parts as &$part) {
-            $part = $this->encodePart($part);
-        }
-
-        return implode('.', $parts);
-    }
-
-    /**
-     * Encode a part of a domain name, such as tld, to its Punycode version
-     *
-     * @param string $input Part of a domain name
-     * @return string Punycode representation of a domain part
-     */
-    protected function encodePart($input)
-    {
-        $codePoints = $this->listCodePoints($input);
-
-        $n = static::INITIAL_N;
-        $bias = static::INITIAL_BIAS;
-        $delta = 0;
-        $h = $b = count($codePoints['basic']);
-
-        $output = '';
-        foreach ($codePoints['basic'] as $code) {
-            $output .= $this->codePointToChar($code);
-        }
-        if ($input === $output) {
-            return $output;
-        }
-        if ($b > 0) {
-            $output .= static::DELIMITER;
-        }
-
-        $codePoints['nonBasic'] = array_unique($codePoints['nonBasic']);
-        sort($codePoints['nonBasic']);
-
-        $i = 0;
-        $length = mb_strlen($input, $this->encoding);
-        while ($h < $length) {
-            $m = $codePoints['nonBasic'][$i++];
-            $delta = $delta + ($m - $n) * ($h + 1);
-            $n = $m;
-
-            foreach ($codePoints['all'] as $c) {
-                if ($c < $n || $c < static::INITIAL_N) {
-                    $delta++;
-                }
-                if ($c === $n) {
-                    $q = $delta;
-                    for ($k = static::BASE;; $k += static::BASE) {
-                        $t = $this->calculateThreshold($k, $bias);
-                        if ($q < $t) {
-                            break;
-                        }
-
-                        $code = $t + (($q - $t) % (static::BASE - $t));
-                        $output .= static::$encodeTable[$code];
-
-                        $q = intdiv($q - $t, static::BASE - $t);
-                    }
-
-                    $output .= static::$encodeTable[$q];
-                    $bias = $this->adapt($delta, $h + 1, ($h === $b));
-                    $delta = 0;
-                    $h++;
-                }
-            }
-
-            $delta++;
-            $n++;
-        }
-
-        return static::PREFIX . $output;
-    }
-
-    /**
-     * Decode a Punycode domain name to its Unicode counterpart
-     *
-     * @param string $input Domain name in Punycode
-     * @return string Unicode domain name
-     */
-    public function decode($input)
-    {
-        $parts = explode('.', $input);
-        foreach ($parts as &$part) {
-            if (strpos($part, static::PREFIX) !== 0) {
-                continue;
-            }
-
-            $part = substr($part, strlen(static::PREFIX));
-            $part = $this->decodePart($part);
-        }
-
-        return implode('.', $parts);
-    }
-
-    /**
-     * Decode a part of domain name, such as tld
-     *
-     * @param string $input Part of a domain name
-     * @return string Unicode domain part
-     */
-    protected function decodePart($input)
-    {
-        $n = static::INITIAL_N;
-        $i = 0;
-        $bias = static::INITIAL_BIAS;
-        $output = '';
-
-        $pos = strrpos($input, static::DELIMITER);
-        if ($pos !== false) {
-            $output = substr($input, 0, $pos++);
-        } else {
-            $pos = 0;
-        }
-
-        $outputLength = strlen($output);
-        $inputLength = strlen($input);
-        while ($pos < $inputLength) {
-            $oldi = $i;
-            $w = 1;
-
-            for ($k = static::BASE;; $k += static::BASE) {
-                $digit = static::$decodeTable[$input[$pos++]];
-                $i = $i + ($digit * $w);
-                $t = $this->calculateThreshold($k, $bias);
-
-                if ($digit < $t) {
-                    break;
-                }
-
-                $w = $w * (static::BASE - $t);
-            }
-
-            $bias = $this->adapt($i - $oldi, ++$outputLength, ($oldi === 0));
-            $n = $n + (int) ($i / $outputLength);
-            $i = $i % ($outputLength);
-            $output = mb_substr($output, 0, $i, $this->encoding) . $this->codePointToChar($n) . mb_substr($output, $i, $outputLength - 1, $this->encoding);
-
-            $i++;
-        }
-
-        return $output;
-    }
-
-    /**
-     * Calculate the bias threshold to fall between TMIN and TMAX
-     *
-     * @param integer $k
-     * @param integer $bias
-     * @return integer
-     */
-    protected function calculateThreshold($k, $bias)
-    {
-        if ($k <= $bias + static::TMIN) {
-            return static::TMIN;
-        } elseif ($k >= $bias + static::TMAX) {
-            return static::TMAX;
-        }
-        return $k - $bias;
-    }
-
-    /**
-     * Bias adaptation
-     *
-     * @param integer $delta
-     * @param integer $numPoints
-     * @param boolean $firstTime
-     * @return integer
-     */
-    protected function adapt($delta, $numPoints, $firstTime)
-    {
-        $delta = (int) (
-            ($firstTime)
-                ? $delta / static::DAMP
-                : $delta / 2
-            );
-        $delta += (int) ($delta / $numPoints);
-
-        $k = 0;
-        while ($delta > ((static::BASE - static::TMIN) * static::TMAX) / 2) {
-            $delta = (int) ($delta / (static::BASE - static::TMIN));
-            $k = $k + static::BASE;
-        }
-        $k = $k + (int) (((static::BASE - static::TMIN + 1) * $delta) / ($delta + static::SKEW));
-
-        return $k;
-    }
-
-    /**
-     * List code points for a given input
-     *
-     * @param string $input
-     * @return array Multi-dimension array with basic, non-basic and aggregated code points
-     */
-    protected function listCodePoints($input)
-    {
-        $codePoints = array(
-            'all'      => array(),
-            'basic'    => array(),
-            'nonBasic' => array(),
-        );
-
-        $length = mb_strlen($input, $this->encoding);
-        for ($i = 0; $i < $length; $i++) {
-            $char = mb_substr($input, $i, 1, $this->encoding);
-            $code = $this->charToCodePoint($char);
-            if ($code < 128) {
-                $codePoints['all'][] = $codePoints['basic'][] = $code;
-            } else {
-                $codePoints['all'][] = $codePoints['nonBasic'][] = $code;
-            }
-        }
-
-        return $codePoints;
-    }
-
-    /**
-     * Convert a single or multi-byte character to its code point
-     *
-     * @param string $char
-     * @return integer
-     */
-    protected function charToCodePoint($char)
-    {
-        $code = ord($char[0]);
-        if ($code < 128) {
-            return $code;
-        } elseif ($code < 224) {
-            return (($code - 192) * 64) + (ord($char[1]) - 128);
-        } elseif ($code < 240) {
-            return (($code - 224) * 4096) + ((ord($char[1]) - 128) * 64) + (ord($char[2]) - 128);
-        } else {
-            return (($code - 240) * 262144) + ((ord($char[1]) - 128) * 4096) + ((ord($char[2]) - 128) * 64) + (ord($char[3]) - 128);
-        }
-    }
-
-    /**
-     * Convert a code point to its single or multi-byte character
-     *
-     * @param integer $code
-     * @return string
-     */
-    protected function codePointToChar($code)
-    {
-        if ($code <= 0x7F) {
-            return chr($code);
-        } elseif ($code <= 0x7FF) {
-            return chr(($code >> 6) + 192) . chr(($code & 63) + 128);
-        } elseif ($code <= 0xFFFF) {
-            return chr(($code >> 12) + 224) . chr((($code >> 6) & 63) + 128) . chr(($code & 63) + 128);
-        } else {
-            return chr(($code >> 18) + 240) . chr((($code >> 12) & 63) + 128) . chr((($code >> 6) & 63) + 128) . chr(($code & 63) + 128);
-        }
-    }
-}			$php_idna = new php_idna();
-			$_url_parts['host'] = $php_idna->encode($_url_parts['host']);
-			break;
-		}
-	}
-
 
 //
 // HOTLINKING PREVENTION
@@ -2136,423 +1873,236 @@ if (!$_config['allow_hotlinking'] && isset($_SERVER['HTTP_REFERER']))
     }
 }
 
-//
-// OPEN SOCKET TO SERVER
-//
-
-do
+/**
+ * Build a bounded browser form upload. File bodies are never read beyond
+ * the common transport's 2 MiB request limit.
+ */
+function phproxy_browser_body(array $post, array $files, string $contentType, string $raw = ''): array
 {
-   $context = stream_context_create();
-   if ( $_bindip != 'default') {
-      $opts = ['socket' => ['bindto' => $_bindip]];
-      $context = stream_context_create($opts);
-   }
-
-   $_retry  = false;
-   // Timing for the Network tab — captured per retry attempt; the LAST values
-   // are the ones that end up in the session log.
-   $_net_start = microtime(true);
-   $_net_ttfb  = null;
-   $_socket = @stream_socket_client(($_url_parts['scheme'] === 'https' && $_system['ssl'] ? 'ssl://' : 'tcp://') . $_url_parts['host']. ":". $_url_parts['port'], $err_no, $err_str, 30,STREAM_CLIENT_CONNECT, $context);
-
-    if ($_socket === false)
-    {
-        show_report(['which' => 'index', 'category' => 'error', 'group' => 'url', 'type' => 'internal', 'error' => $err_no]);
-    }
-
-    //
-    // SET REQUEST HEADERS
-    //
-    // Anonymity invariant: the outbound header set is built from scratch
-    // out of a known-safe whitelist (method, path, Host, User-Agent, Accept,
-    // optional Referer, Cookie, Authorization, and POST body headers).
-    // We never forward client-identifying $_SERVER['HTTP_X_FORWARDED_FOR'],
-    // 'HTTP_X_REAL_IP', 'HTTP_VIA', 'HTTP_FORWARDED', or any other inbound
-    // proxy header to the upstream. Targets see this server's IP only.
-    //
-
-    $_request_headers  = $_request_method . ' ' . $_url_parts['path'];
-
-    if (isset($_url_parts['query']))
-    {
-        $_request_headers .= '?';
-        $query = preg_split('#([&;])#', $_url_parts['query'], -1, PREG_SPLIT_DELIM_CAPTURE);
-        for ($i = 0, $count = count($query); $i < $count; $_request_headers .= implode('=', array_map('urlencode', array_map('urldecode', explode('=', $query[$i])))) . (isset($query[++$i]) ? $query[$i] : ''), $i++);
-    }
-
-    $_request_headers .= " HTTP/1.0\r\n";
-    $_request_headers .= 'Host: ' . $_url_parts['host'] . $_url_parts['port_ext'] . "\r\n";
-
-    // Collect user-supplied hdr_<Name> overrides up front. When any of the
-    // defaults below have a matching override (case-insensitive), the
-    // default is skipped — the override appears in the loop further down.
-    // Host is never overridable; it's derived from the URL.
-    $_hdr_overrides = [];
-    foreach ($_COOKIE as $_ck => $_cv) {
-        if (strpos($_ck, 'hdr_') !== 0) continue;
-        $_hn = substr($_ck, 4);
-        if ($_hn !== '' && strcasecmp($_hn, 'host') !== 0
-            && preg_match('/^[A-Za-z0-9-]+$/', $_hn)
-            && strpbrk($_cv, "\r\n") === false) {
-            $_hdr_overrides[strtolower($_hn)] = $_cv;
-        }
-    }
-
-    if (!isset($_hdr_overrides['user-agent']) && !empty($_user_agent))
-    {
-        $_request_headers .= 'User-Agent: ' . $_user_agent . "\r\n";
-    }
-    if (!isset($_hdr_overrides['accept']))
-    {
-        if (isset($_SERVER['HTTP_ACCEPT'])) {
-            $_request_headers .= 'Accept: ' . $_SERVER['HTTP_ACCEPT'] . "\r\n";
+    $limit = 2 * 1024 * 1024;
+    if ($files === []) {
+        if (str_starts_with(strtolower($contentType), 'application/x-www-form-urlencoded')
+            || str_starts_with(strtolower($contentType), 'multipart/form-data') || $contentType === '') {
+            $body = http_build_query($post);
+            $contentType = 'application/x-www-form-urlencoded';
         } else {
-            $_request_headers .= "Accept: */*;q=0.1\r\n";
+            $body = $raw;
         }
+        if (strlen($body) > $limit) throw new RuntimeException('Request body exceeds 2 MiB.');
+        return ['body' => $body, 'content_type' => $contentType];
     }
-    if (!isset($_hdr_overrides['referer'])
-        && $_flags['show_referer']
-        && isset($_SERVER['HTTP_REFERER'])
-        && preg_match('#^\Q' . $_script_url . '?' . $_config['url_var_name'] . '=\E([^&]+)#', $_SERVER['HTTP_REFERER'], $matches))
-    {
-        $_request_headers .= 'Referer: ' . decode_url($matches[1]) . "\r\n";
+    $boundary = '----phproxy' . bin2hex(random_bytes(18));
+    $quote = static fn(string $s): string => str_replace(["\\", '"', "\r", "\n"], ['\\\\', '%22', '', ''], $s);
+    $body = '';
+    foreach (set_post_vars($post) as $name => $value) {
+        $body .= '--' . $boundary . "\r\nContent-Disposition: form-data; name=\"" . $quote(urldecode($name)) . "\"\r\n\r\n" . urldecode($value) . "\r\n";
+        if (strlen($body) > $limit) throw new RuntimeException('Request body exceeds 2 MiB.');
     }
-    if (!isset($_hdr_overrides['dnt']) && $_flags['send_dnt'])
-    {
-        $_request_headers .= "DNT: 1\r\n";
+    foreach (set_post_files($files) as $name => $file) {
+        $tmp = (string) ($file['tmp_name'] ?? '');
+        if ($tmp === '' || !is_uploaded_file($tmp)) continue;
+        $remaining = $limit - strlen($body);
+        if ($remaining <= 0 || filesize($tmp) > $remaining) throw new RuntimeException('Request body exceeds 2 MiB.');
+        $type = (string) ($file['type'] ?? '');
+        if (!preg_match('~^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$~D', $type)) $type = 'application/octet-stream';
+        $body .= '--' . $boundary . "\r\nContent-Disposition: form-data; name=\"" . $quote(urldecode($name))
+            . '"; filename="' . $quote((string) ($file['name'] ?? 'upload')) . "\"\r\nContent-Type: " . $type . "\r\n\r\n";
+        $data = file_get_contents($tmp, false, null, 0, $remaining + 1);
+        if ($data === false) throw new RuntimeException('Unable to read uploaded file.');
+        $body .= $data . "\r\n";
+        if (strlen($body) > $limit) throw new RuntimeException('Request body exceeds 2 MiB.');
     }
-    if (!isset($_hdr_overrides['sec-gpc']) && $_flags['send_gpc'])
-    {
-        $_request_headers .= "Sec-GPC: 1\r\n";
+    $body .= '--' . $boundary . "--\r\n";
+    if (strlen($body) > $limit) throw new RuntimeException('Request body exceeds 2 MiB.');
+    return ['body' => $body, 'content_type' => 'multipart/form-data; boundary=' . $boundary];
+}
+
+function phproxy_trace_store(string $url, string $method, array $headers, array $response): void
+{
+    $pairs = [];
+    foreach (array_slice($headers, 0, 40, true) as $name => $value) {
+        $sensitive = preg_match('/authorization|cookie|token|secret|key/i', $name);
+        $pairs[] = [substr($name, 0, 128), $sensitive ? '[redacted]' : substr((string) $value, 0, 1024)];
     }
-    // User-supplied custom headers — these include both pure additions
-    // (e.g. Accept-Language) and overrides of the defaults above.
-    foreach ($_COOKIE as $_ck => $_cv)
-    {
-        if (strpos($_ck, 'hdr_') !== 0) continue;
-        $_hdr_name = substr($_ck, 4);
-        if (strcasecmp($_hdr_name, 'host') === 0) continue;
-        if (preg_match('/^[A-Za-z0-9-]+$/', $_hdr_name) && strpbrk($_cv, "\r\n") === false) {
-            $_request_headers .= $_hdr_name . ': ' . $_cv . "\r\n";
-        }
+    $responsePairs = [];
+    foreach (array_slice($response['header_lines'] ?? [], 0, 40) as $entry) {
+        $sensitive = preg_match('/authorization|cookie|token|secret|key/i', $entry['name']);
+        $responsePairs[] = [substr($entry['name'], 0, 128), $sensitive ? '[redacted]' : substr($entry['value'], 0, 1024)];
     }
-    if (!empty($_COOKIE))
-    {
-        $_cookie  = '';
-        $_auth_creds    = [];
+    $path = parse_url($url, PHP_URL_PATH) ?: '/';
+    phproxy_state_open();
+    $_SESSION['phproxy_trace'] = [
+        'url' => substr($url, 0, 2048), 'method' => $method,
+        'request_line' => $method . ' ' . substr($path, 0, 2048) . ' HTTP/1.1',
+        'request_pairs' => $pairs, 'response_pairs' => $responsePairs,
+    ];
+    phproxy_state_close();
+}
 
-        foreach ($_COOKIE as $cookie_id => $cookie_content)
-        {
-            $cookie_id      = explode(';', rawurldecode($cookie_id));
-            $cookie_content = explode(';', rawurldecode($cookie_content));
-
-            if ($cookie_id[0] === 'COOKIE')
-            {
-                $cookie_id[3] = str_replace('_', '.', $cookie_id[3]); //stupid PHP can't have dots in var names
-
-                if (count($cookie_id) < 4 || ($cookie_content[1] == 'secure' && $_url_parts['scheme'] != 'https'))
-                {
-                    continue;
-                }
-
-                if ((preg_match('#\Q' . $cookie_id[3] . '\E$#i', $_url_parts['host']) || strtolower($cookie_id[3]) == strtolower('.' . $_url_parts['host'])) && preg_match('#^\Q' . $cookie_id[2] . '\E#', $_url_parts['path']))
-                {
-                    $_cookie .= ($_cookie != '' ? '; ' : '') . (empty($cookie_id[1]) ? '' : $cookie_id[1] . '=') . $cookie_content[0];
-                }
-            }
-            else if ($cookie_id[0] === 'AUTH' && count($cookie_id) === 3)
-            {
-                $cookie_id[2] = str_replace('_', '.', $cookie_id[2]);
-
-                if ($_url_parts['host'] . ':' . $_url_parts['port'] === $cookie_id[2])
-                {
-                    $_auth_creds[$cookie_id[1]] = $cookie_content[0];
-                }
-            }
-        }
-
-        if ($_cookie != '')
-        {
-            $_request_headers .= "Cookie: $_cookie\r\n";
-        }
-    }
-    if (isset($_url_parts['user'], $_url_parts['pass']))
-    {
-        $_basic_auth_header = base64_encode($_url_parts['user'] . ':' . $_url_parts['pass']);
-    }
-    if (!empty($_basic_auth_header))
-    {
-        $_set_cookie[] = add_cookie("AUTH;{$_basic_auth_realm};{$_url_parts['host']}:{$_url_parts['port']}", $_basic_auth_header);
-        $_request_headers .= "Authorization: Basic {$_basic_auth_header}\r\n";
-    }
-    else if (!empty($_basic_auth_realm) && isset($_auth_creds[$_basic_auth_realm]))
-    {
-        $_request_headers  .= "Authorization: Basic {$_auth_creds[$_basic_auth_realm]}\r\n";
-    }
-    else if (!empty($_auth_creds))
-    {
-        $_basic_auth_realm  = array_key_first($_auth_creds);
-        $_basic_auth_header = $_auth_creds[$_basic_auth_realm];
-
-        $_request_headers .= "Authorization: Basic {$_basic_auth_header}\r\n";
-    }
-    if ($_request_method == 'POST')
-    {
-        if (!empty($_FILES) && $_system['uploads'])
-        {
-            $_data_boundary = '----' . md5(uniqid(rand(), true));
-            $array = set_post_vars($_POST);
-
-            foreach ($array as $key => $value)
-            {
-                $_post_body .= "--{$_data_boundary}\r\n";
-                $_post_body .= "Content-Disposition: form-data; name=\"$key\"\r\n\r\n";
-                $_post_body .= urldecode($value) . "\r\n";
-            }
-
-            $array = set_post_files($_FILES);
-
-            foreach ($array as $key => $file_info)
-            {
-                $_post_body .= "--{$_data_boundary}\r\n";
-                $_post_body .= "Content-Disposition: form-data; name=\"$key\"; filename=\"{$file_info['name']}\"\r\n";
-                $_post_body .= 'Content-Type: ' . (empty($file_info['type']) ? 'application/octet-stream' : $file_info['type']) . "\r\n\r\n";
-
-                if (is_readable($file_info['tmp_name']))
-                {
-                    $handle = fopen($file_info['tmp_name'], 'rb');
-                    $_post_body .= fread($handle, filesize($file_info['tmp_name']));
-                    fclose($handle);
-                }
-
-                $_post_body .= "\r\n";
-            }
-
-            $_post_body       .= "--{$_data_boundary}--\r\n";
-            $_request_headers .= "Content-Type: multipart/form-data; boundary={$_data_boundary}\r\n";
-            $_request_headers .= "Content-Length: " . strlen($_post_body) . "\r\n\r\n";
-            $_request_headers .= $_post_body;
-        }
-        else
-        {
-            $array = set_post_vars($_POST);
-
-            foreach ($array as $key => $value)
-            {
-                $_post_body .= !empty($_post_body) ? '&' : '';
-                $_post_body .= $key . '=' . $value;
-            }
-            $_request_headers .= "Content-Type: application/x-www-form-urlencoded\r\n";
-            $_request_headers .= "Content-Length: " . strlen($_post_body) . "\r\n\r\n";
-            $_request_headers .= $_post_body;
-            $_request_headers .= "\r\n";
-        }
-
-        $_post_body = '';
-    }
-    else
-    {
-        $_request_headers .= "\r\n";
-    }
-
-    fwrite($_socket, $_request_headers);
-
-    //
-    // PROCESS RESPONSE HEADERS
-    //
-
-    $_response_headers = $_response_keys = [];
-
-    $line = fgets($_socket, 8192);
-    if ($_net_ttfb === null) $_net_ttfb = microtime(true);
-
-    while (strspn($line, "\r\n") !== strlen($line))
-    {
-        @list($name, $value) = explode(':', $line, 2);
-        $name = trim((string) $name);
-        $_response_headers[strtolower($name)][] = trim((string) $value);
-        $_response_keys[strtolower($name)] = $name;
-        $line = fgets($_socket, 8192);
-    }
-
-    sscanf(current($_response_keys), '%s %s', $_http_version, $_response_code);
-
-    if (isset($_response_headers['content-type']))
-    {
-        list($_content_type, ) = explode(';', str_replace(' ', '', strtolower($_response_headers['content-type'][0])), 2);
-    }
-    if (isset($_response_headers['content-length']))
-    {
-        $_content_length = $_response_headers['content-length'][0];
-        unset($_response_headers['content-length'], $_response_keys['content-length']);
-    }
-    if (isset($_response_headers['content-disposition']))
-    {
-        $_content_disp = $_response_headers['content-disposition'][0];
-        unset($_response_headers['content-disposition'], $_response_keys['content-disposition']);
-    }
-    if (isset($_response_headers['set-cookie']) && $_flags['accept_cookies'])
-    {
-        foreach ($_response_headers['set-cookie'] as $cookie)
-        {
-            $name = $value = $expires = $path = $domain = $secure = $expires_time = '';
-
-            preg_match('#^\s*([^=;,\s]*)\s*=?\s*([^;]*)#',  $cookie, $match) && list(, $name, $value) = $match;
-            preg_match('#;\s*expires\s*=\s*([^;]*)#i',      $cookie, $match) && list(, $expires)      = $match;
-            preg_match('#;\s*path\s*=\s*([^;,\s]*)#i',      $cookie, $match) && list(, $path)         = $match;
-            preg_match('#;\s*domain\s*=\s*([^;,\s]*)#i',    $cookie, $match) && list(, $domain)       = $match;
-            preg_match('#;\s*(secure\b)#i',                 $cookie, $match) && list(, $secure)       = $match;
-
-            $expires_time = empty($expires) ? 0 : intval(@strtotime($expires));
-            $expires = ($_flags['session_cookies'] && !empty($expires) && time()-$expires_time < 0) ? '' : $expires;
-            $path    = empty($path)   ? '/' : $path;
-
-            if (empty($domain))
-            {
-                $domain = $_url_parts['host'];
-            }
-            else
-            {
-                $domain = '.' . strtolower(str_replace('..', '.', trim((string) $domain, '.')));
-
-                if ((!preg_match('#\Q' . $domain . '\E$#i', $_url_parts['host']) && $domain != '.' . $_url_parts['host']) || (substr_count($domain, '.') < 2 && $domain[0] == '.'))
-                {
-                    continue;
-                }
-            }
-            if (count($_COOKIE) >= 15 && time()-$expires_time <= 0)
-            {
-                $_set_cookie[] = add_cookie(current($_COOKIE), '', 1);
-            }
-
-            $_set_cookie[] = add_cookie("COOKIE;$name;$path;$domain", "$value;$secure", $expires_time);
-        }
-    }
-    if (isset($_response_headers['set-cookie']))
-    {
-        unset($_response_headers['set-cookie'], $_response_keys['set-cookie']);
-    }
-    if (!empty($_set_cookie))
-    {
-        $_response_keys['set-cookie'] = 'Set-Cookie';
-        $_response_headers['set-cookie'] = $_set_cookie;
-    }
-    if (isset($_response_headers['p3p']) && preg_match('#policyref\s*=\s*[\'"]?([^\'"\s]*)[\'"]?#i', $_response_headers['p3p'][0], $matches))
-    {
-        $_response_headers['p3p'][0] = str_replace($matches[0], 'policyref="' . complete_url($matches[1]) . '"', $_response_headers['p3p'][0]);
-    }
-    if (isset($_response_headers['refresh']) && preg_match('#([0-9\s]*;\s*URL\s*=)\s*(\S*)#i', $_response_headers['refresh'][0], $matches))
-    {
-        $_response_headers['refresh'][0] = $matches[1] . complete_url($matches[2]);
-    }
-    if (isset($_response_headers['location']))
-    {
-        $_response_headers['location'][0] = complete_url($_response_headers['location'][0]);
-    }
-    if (isset($_response_headers['uri']))
-    {
-        $_response_headers['uri'][0] = complete_url($_response_headers['uri'][0]);
-    }
-    if (isset($_response_headers['content-location']))
-    {
-        $_response_headers['content-location'][0] = complete_url($_response_headers['content-location'][0]);
-    }
-    if (isset($_response_headers['connection']))
-    {
-        unset($_response_headers['connection'], $_response_keys['connection']);
-    }
-    if (isset($_response_headers['keep-alive']))
-    {
-        unset($_response_headers['keep-alive'], $_response_keys['keep-alive']);
-    }
-    if ($_response_code == 401 && isset($_response_headers['www-authenticate']) && preg_match('#basic\s+(?:realm="(.*?)")?#i', $_response_headers['www-authenticate'][0], $matches))
-    {
-        if (isset($_auth_creds[$matches[1]]) && !$_quit)
-        {
-            $_basic_auth_realm  = $matches[1];
-            $_basic_auth_header = '';
-            $_retry = $_quit = true;
-        }
-        else
-        {
-            show_report(['which' => 'index', 'category' => 'auth', 'realm' => $matches[1]]);
+// Browser requests use exactly the same destination policy, HTTP framing,
+// certificate verification, byte limits and deadline as the JSON API.
+$_state = phproxy_state_snapshot();
+$_origin = phproxy_request_origin($_url);
+$_out_headers = [
+    'user-agent' => (string) ($_user_agent ?? ''),
+    'accept' => (string) ($_SERVER['HTTP_ACCEPT'] ?? '*/*'),
+];
+if ($_flags['send_dnt']) $_out_headers['dnt'] = '1';
+if ($_flags['send_gpc']) $_out_headers['sec-gpc'] = '1';
+if ($_flags['show_referer'] && isset($_SERVER['HTTP_REFERER'])) {
+    $_referer_prefix = $_script_url . '?' . $_config['url_var_name'] . '=';
+    if (str_starts_with($_SERVER['HTTP_REFERER'], $_referer_prefix)) {
+        $_referer_token = explode('&', substr($_SERVER['HTTP_REFERER'], strlen($_referer_prefix)), 2)[0];
+        $_referer = decode_url($_referer_token);
+        if ($_referer !== '' && !preg_match('/[\x00-\x1f\x7f]/', $_referer)) {
+            // Do not send another site's sensitive path/query across origins.
+            $_out_headers['referer'] = phproxy_request_origin($_referer) === $_origin
+                ? $_referer : (phproxy_request_origin($_referer) . '/');
         }
     }
 }
-while ($_retry);
-
-//
-// OUTPUT RESPONSE IF NO PROXIFICATION IS NEEDED
-//
-
-if (!isset($_proxify[$_content_type]))
-{
-    @set_time_limit(0);
-
-    $_response_keys['content-disposition'] = 'Content-Disposition';
-    $_response_headers['content-disposition'][0] = empty($_content_disp) ? ($_content_type == 'application/octet_stream' ? 'attachment' : 'inline') . '; filename="' . $_url_parts['file'] . '"' : $_content_disp;
-
-    if ($_content_length !== false)
-    {
-        if ($_config['max_file_size'] != -1 && $_content_length > $_config['max_file_size'])
-        {
-            show_report(['which' => 'index', 'category' => 'error', 'group' => 'resource', 'type' => 'file_size']);
-        }
-
-        $_response_keys['content-length'] = 'Content-Length';
-        $_response_headers['content-length'][0] = $_content_length;
+foreach ($_state['phproxy_headers'] ?? [] as $_name => $_entry) {
+    if ($_entry['origin'] === $_origin && phproxy_custom_header_allowed($_name, $_entry['value'])) {
+        $_out_headers[strtolower($_name)] = $_entry['value'];
     }
+}
+$_cookie = phproxy_cookie_header($_state['phproxy_jar'] ?? [], $_url, (bool) $_flags['accept_cookies']);
+if ($_cookie !== '') $_out_headers['cookie'] = $_cookie;
+if ($_basic_auth_header === '') {
+    foreach ($_state['phproxy_auth'][$_origin] ?? [] as $_realm => $_saved_auth) {
+        if (phproxy_cookie_path_matches($_url_parts['path'], $_saved_auth['path'])) {
+            $_basic_auth_realm = $_realm;
+            $_basic_auth_header = $_saved_auth['header'];
+            break;
+        }
+    }
+}
+if ($_basic_auth_header !== '') $_out_headers['authorization'] = 'Basic ' . $_basic_auth_header;
 
-    $_response_headers   = array_filter($_response_headers);
-    $_response_keys      = array_filter($_response_keys);
+$_post_body = '';
+try {
+    if (in_array($_request_method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+        if ((int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > 2 * 1024 * 1024) {
+            throw new RuntimeException('Request body exceeds 2 MiB.');
+        }
+        $_body_content_type = (string) ($_SERVER['CONTENT_TYPE'] ?? '');
+        $_raw_body = '';
+        if ($_FILES === [] && !str_starts_with(strtolower($_body_content_type), 'application/x-www-form-urlencoded')
+            && !str_starts_with(strtolower($_body_content_type), 'multipart/form-data')) {
+            $_raw_body = (string) file_get_contents('php://input', false, null, 0, 2 * 1024 * 1024 + 1);
+        }
+        $_built_body = phproxy_browser_body($_POST, $_FILES, $_body_content_type, $_raw_body);
+        $_post_body = $_built_body['body'];
+        $_out_headers['content-type'] = $_built_body['content_type'];
+    }
+} catch (Throwable $e) {
+    http_response_code(413);
+    header('Content-Type: text/plain; charset=utf-8');
+    exit('The request body could not be forwarded. The maximum size is 2 MiB.');
+}
+$_net_start = microtime(true);
+phproxy_state_close();
+$_result = phproxy_api_fetch([
+    'url' => $_url, 'method' => $_request_method, 'headers' => $_out_headers,
+    'body' => $_post_body, 'follow_redirects' => false, 'timeout' => 30,
+    'max_response_bytes' => $_config['max_file_size'] > 0 ? $_config['max_file_size'] : 8388608,
+]);
+$_net_end = microtime(true);
+$_net_ttfb = isset($_result['ttfb_ms']) ? $_net_start + $_result['ttfb_ms'] / 1000 : null;
+if (empty($_result['ok'])) {
+    http_response_code((int) ($_result['http_status'] ?? 502));
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store');
+    exit('Unable to fetch the destination: ' . ($_result['error'] ?? 'upstream request failed'));
+}
 
+$_response_code = (int) $_result['status'];
+$_response_body = $_result['body_raw'];
+$_response_keys = ['status' => 'HTTP/1.1 ' . $_response_code . ' ' . $_result['status_text']];
+$_response_headers = ['status' => []];
+foreach ($_result['header_lines'] as $_entry) {
+    $_lower_name = strtolower($_entry['name']);
+    $_response_keys[$_lower_name] = $_entry['name'];
+    $_response_headers[$_lower_name][] = $_entry['value'];
+}
+$_content_type = strtolower(trim(explode(';', $_result['headers']['content-type'] ?? 'application/octet-stream', 2)[0]));
+$_content_disp = $_result['headers']['content-disposition'] ?? '';
+phproxy_store_cookies($_result['set_cookie_headers'], $_url, (bool) $_flags['accept_cookies'], (bool) $_flags['session_cookies']);
+phproxy_trace_store($_url, $_request_method, $_out_headers, $_result);
+phproxy_net_log($_url, $_request_method, $_response_code, $_content_type, strlen($_response_body), $_net_start, $_net_ttfb, $_net_end);
+
+if ($_response_code === 401 && isset($_result['headers']['www-authenticate'])
+    && preg_match('/basic\s+(?:realm="([^"]*)")?/i', $_result['headers']['www-authenticate'], $_challenge)) {
+    $_basic_auth_realm = substr($_challenge[1] ?? '', 0, 256);
+    show_report(['which' => 'index', 'category' => 'auth', 'realm' => $_basic_auth_realm]);
+}
+if ($_basic_auth_header !== '' && $_response_code < 400) {
+    phproxy_state_open();
+    $_SESSION['phproxy_auth'][$_origin][$_basic_auth_realm] = [
+        'header' => $_basic_auth_header,
+        'path' => ($_url_parts['dir'] ?: '') . '/',
+    ];
+    $_SESSION['phproxy_auth'][$_origin] = array_slice($_SESSION['phproxy_auth'][$_origin], -10, null, true);
+    $_SESSION['phproxy_auth'] = array_slice($_SESSION['phproxy_auth'], -20, null, true);
+    phproxy_state_close();
+}
+foreach (['location', 'uri', 'content-location'] as $_location_header) {
+    if (isset($_response_headers[$_location_header][0])) {
+        $_response_headers[$_location_header][0] = complete_url($_response_headers[$_location_header][0]);
+    }
+}
+unset($_response_headers['www-authenticate'], $_response_keys['www-authenticate']);
+
+// Unknown content encodings cannot be rewritten safely.
+if (!isset($_proxify[$_content_type]) || isset($_result['headers']['content-encoding'])) {
+    $_response_headers['content-length'] = [(string) strlen($_response_body)];
+    $_response_keys['content-length'] = 'Content-Length';
     header(array_shift($_response_keys));
     array_shift($_response_headers);
-
-    foreach ($_response_headers as $name => $array)
-    {
-        foreach ($array as $value)
-        {
-            header($_response_keys[$name] . ': ' . $value, false);
-        }
+    foreach ($_response_headers as $_name => $_values) {
+        foreach ($_values as $_value) header($_response_keys[$_name] . ': ' . $_value, false);
     }
-
-    $_stream_size = 0;
-    do
-    {
-        $data = fread($_socket, 8192);
-        echo $data;
-        $_stream_size += strlen((string) $data);
-    }
-    while (isset($data[0]));
-
-    fclose($_socket);
-    phproxy_net_log($_url, $_request_method, (int) $_response_code, $_content_type, $_stream_size, $_net_start, $_net_ttfb, microtime(true));
-    exit(0);
+    phproxy_untrusted_response_headers(empty($_flags['remove_scripts']));
+    if ($_request_method !== 'HEAD') echo $_response_body;
+    exit;
 }
-
-do
-{
-    $data = @fread($_socket, 8192); // silenced to avoid the "normal" warning by a faulty SSL connection
-    $_response_body .= $data;
-}
-while (isset($data[0]));
-
-unset($data);
-fclose($_socket);
-
-phproxy_net_log($_url, $_request_method, (int) $_response_code, $_content_type, strlen($_response_body), $_net_start, $_net_ttfb, microtime(true));
 
 //
 // MODIFY AND DUMP RESOURCE
 //
 
-if ($_content_type == 'text/css')
-{
+$_browsing_shell = false;
+if ($_content_type === 'text/css') {
     $_response_body = proxify_css($_response_body);
+} else {
+    $_browsing_shell = $_flags['include_form'] && !isset($_GET['nf'])
+        && ($_SERVER['HTTP_SEC_FETCH_DEST'] ?? '') !== 'iframe';
+    if ($_browsing_shell) {
+        $_response_body = phproxy_html_utf8($_response_body, $_result['headers']['content-type'] ?? '');
+    }
+    $_response_body = phproxy_rewrite_html($_response_body, (bool) $_browsing_shell);
+    if ($_browsing_shell) {
+        $_current_proxy_url = $_script_url . '?' . $_config['url_var_name'] . '=' . encode_url($_url);
+        $_response_body = phproxy_browsing_bar($_response_body, $_script_url, $_url,
+            phproxy_navigation_token(), phproxy_browsing_panel($_current_proxy_url, $_url),
+            empty($_flags['remove_scripts']));
+    }
 }
-else
+$_response_headers['content-length'] = [(string) strlen($_response_body)];
+$_response_keys['content-length'] = 'Content-Length';
+header(array_shift($_response_keys));
+array_shift($_response_headers);
+foreach ($_response_headers as $name => $values) {
+    foreach ((array) $values as $value) header($_response_keys[$name] . ': ' . $value, false);
+}
+if ($_browsing_shell) phproxy_browsing_shell_headers();
+else phproxy_untrusted_response_headers(empty($_flags['remove_scripts']));
+echo $_response_body;
+
+/** Rebuild each matched tag once, without rescanning the document per tag. */
+function phproxy_rewrite_html(string $_response_body, bool $framed = false): string
 {
+    global $_flags, $_base, $_url_parts, $_config, $_url, $_script_url, $_iflags;
     if ($_flags['strip_title'])
     {
         $_response_body = preg_replace('#(<\s*title[^>]*>)(.*?)(<\s*/title[^>]*>)#is', '$1$3', $_response_body);
@@ -2633,27 +2183,27 @@ else
         'source'     => ['srcset'],
     );
 
-    preg_match_all('#(<\s*style[^>]*>)(.*?)(<\s*/\s*style[^>]*>)#is', $_response_body, $matches, PREG_SET_ORDER);
+    $_response_body = preg_replace_callback(
+        '#(<\s*style[^>]*>)(.*?)(<\s*/\s*style[^>]*>)#is',
+        static fn(array $match): string => $match[1] . proxify_css($match[2]) . $match[3],
+        $_response_body
+    ) ?? $_response_body;
 
-    for ($i = 0, $count_i = count($matches); $i < $count_i; ++$i)
-    {
-        $_response_body = str_replace($matches[$i][0], $matches[$i][1]. proxify_css($matches[$i][2]) .$matches[$i][3], $_response_body);
-    }
-
-    preg_match_all("#<\s*([a-zA-Z0-9\?-]+)(((?:\s+[a-zA-Z0-9:\-\/]+(?:\s*=\s*(?:(?:\"[^\"]*\")|(?:'[^']*')|[^>\s]+))?)*)\s*(>|\/>))#s", $_response_body, $matches);
-
-    for ($i = 0, $count_i = count($matches[0]); $i < $count_i; ++$i)
-    {
-        if (!preg_match_all("#([a-zA-Z0-9:\-\/]+)\s*(?:=\s*(?:\"([^\"]*)\"?|'([^']*)'?|([^'\"\s>]*)))?#s", $matches[2][$i], $m, PREG_SET_ORDER))
+    $rewritten = preg_replace_callback("#<\s*([a-zA-Z0-9\?-]+)(((?:\s+[a-zA-Z0-9:\-\/]+(?:\s*=\s*(?:(?:\"[^\"]*\")|(?:'[^']*')|[^>\s]+))?)*)\s*(>|\/>))#s", static function (array $match) use ($tags, $framed): string {
+        global $_flags, $_base, $_url_parts, $_config, $_url, $_script_url, $_iflags;
+        $tag = strtolower($match[1]);
+        if (!preg_match_all("#([a-zA-Z0-9:\-\/]+)\s*(?:=\s*(?:\"([^\"]*)\"?|'([^']*)'?|([^'\"\s>]*)))?#s", $match[2], $m, PREG_SET_ORDER))
         {
-            continue;
+            if (!$framed || $tag !== 'form') return $match[0];
         }
 
         $rebuild    = false;
+        $drop_tag   = false;
         $extra_html = $temp = '';
         $attrs      = [];
 
         for ($j = 0, $count_j = count($m); $j < $count_j; $attrs[strtolower($m[$j][1])] = (isset($m[$j][4]) ? $m[$j][4] : (isset($m[$j][3]) ? $m[$j][3] : (isset($m[$j][2]) ? $m[$j][2] : false))), ++$j);
+        $original_href = isset($attrs['href']) ? html_entity_decode(trim((string) $attrs['href']), ENT_QUOTES | ENT_HTML5, 'UTF-8') : '';
 
         if (isset($attrs['style']))
         {
@@ -2661,7 +2211,7 @@ else
             $attrs['style'] = proxify_inline_css($attrs['style']);
         }
 
-        $tag = strtolower($matches[1][$i]);
+        $tag = strtolower($match[1]);
 
         if (isset($tags[$tag]))
         {
@@ -2721,6 +2271,8 @@ else
                     {
                         $rebuild = true;
                         $str = preg_replace('/\s+/', ' ', $attrs['srcset']);
+                        $final = '';
+                        $src_set_data_2 = [];
                         $src_set_data = explode(',', $attrs['srcset']);
                         foreach($src_set_data as $item) {
                             $item = trim($item);
@@ -2744,6 +2296,8 @@ else
                     {
                         $rebuild = true;
                         $str = preg_replace('/\s+/', ' ', $attrs['data-srcset']);
+                        $final = '';
+                        $src_set_data_2 = [];
                         $src_set_data = explode(',', $attrs['data-srcset']);
                         foreach($src_set_data as $item) {
                             $item = trim($item);
@@ -2776,7 +2330,7 @@ else
                     if (!isset($attrs['src']) && isset($attrs['data-src']))
                     {
                         $rebuild = true;
-                        $attrs['src'] = complete_url($attrs['data-src']);
+                        $attrs['src'] = $attrs['data-src'];
                     }
                     break;
                 case 'form':
@@ -2810,14 +2364,29 @@ else
                     if (isset($attrs['href']))
                     {
                         $rebuild = true;
-                        url_parse($attrs['href'], $_base);
-                        $attrs['href'] = complete_url($attrs['href']);
+                        $base_url = complete_url($attrs['href'], false);
+                        $base_parts = parse_url($base_url);
+                        if (isset($base_parts['scheme'], $base_parts['host'])
+                            && in_array(strtolower($base_parts['scheme']), ['http', 'https'], true)) {
+                            url_parse($base_url, $_base);
+                        }
+                        $attrs['href'] = complete_url($base_url);
                     }
+                    // All supported references are explicit after rewriting.
+                    // Do not let a srcdoc base element change fragment targets.
+                    if ($framed) $drop_tag = true;
                     break;
                 case 'meta':
+                    // The proxy supplies the document policy after rewriting.
+                    // Upstream policies refer to its original origin and can
+                    // otherwise block rewritten styles and the browsing bar.
+                    if (isset($attrs['http-equiv'])
+                        && strtolower(trim($attrs['http-equiv'])) === 'content-security-policy') {
+                        $drop_tag = true;
+                    }
                     if ($_flags['strip_meta'] && isset($attrs['name']))
                     {
-                        $_response_body = str_replace($matches[0][$i], '', $_response_body);
+                        $drop_tag = true;
                     }
                     if (isset($attrs['http-equiv'], $attrs['content']) && preg_match('#\s*refresh\s*#i', $attrs['http-equiv']))
                     {
@@ -2921,6 +2490,8 @@ else
                     {
                         $rebuild = true;
                         $str = preg_replace('/\s+/', ' ', $attrs['srcset']);
+                        $final = '';
+                        $src_set_data_2 = [];
                         $src_set_data = explode(',', $attrs['srcset']);
                         foreach($src_set_data as $item) {
                             $item = trim($item);
@@ -2954,499 +2525,235 @@ else
             }
         }
 
-        if ($rebuild)
-        {
-            $new_tag = "<$tag";
-            $unpaired_slash = array_key_exists('/', $attrs) ? true : false ;
-            foreach ($attrs as $name => $value)
-            {
-                if($name !== '/') {
-                    $delim = strpos($value, '"') && !strpos($value, "'") ? "'" : '"';
-                    $new_tag .= ' ' . $name . ($value !== false ? '=' . $delim . $value . $delim : '');
+        if ($framed) {
+            if (in_array($tag, ['a', 'area'], true) && isset($attrs['href'])) {
+                $rebuild = true;
+                if (str_starts_with($original_href, '#')) {
+                    // A bare fragment in srcdoc otherwise resolves against
+                    // the outer proxy URL and can reload it inside the frame.
+                    $attrs['href'] = 'about:srcdoc' . $original_href;
+                    $attrs['target'] = '_self';
+                } else {
+                    $attrs['target'] = strtolower(trim((string) ($attrs['target'] ?? ''))) === '_blank' ? '_blank' : '_top';
                 }
+            } elseif ($tag === 'form') {
+                $rebuild = true;
+                $attrs['target'] = strtolower(trim((string) ($attrs['target'] ?? ''))) === '_blank' ? '_blank' : '_top';
+                // POST forms with no action must not submit to about:srcdoc.
+                if (!isset($attrs['action'])) $attrs['action'] = complete_url($_url);
+            } elseif (in_array($tag, ['button', 'input'], true) && isset($attrs['formtarget'])) {
+                $rebuild = true;
+                $attrs['formtarget'] = strtolower(trim((string) $attrs['formtarget'])) === '_blank' ? '_blank' : '_top';
             }
-            $_response_body = str_replace($matches[0][$i], $new_tag . ($unpaired_slash ? '/>' : '>') . $extra_html, $_response_body);
         }
-    }
 
-if(preg_match('/http[s]?:\/\/(ipv[46]|www).google\.[a-z]+(\.)?[a-z]+\/+sorry\/+index/', $_url)) {
-	$_response_body = 'We\'re sorry but Google Search is temporarily unavailable in our service due to high demand. We recommend you to use Microsoft Bing Search instead.';
+        if (!$rebuild && !$drop_tag) return $match[0];
+        if ($drop_tag) return '';
+        $new_tag = "<$tag";
+        $unpaired_slash = array_key_exists('/', $attrs);
+        foreach ($attrs as $name => $value) {
+            if ($name === '/') continue;
+            $escaped = htmlspecialchars(html_entity_decode((string) $value, ENT_QUOTES | ENT_HTML5, 'UTF-8'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $new_tag .= ' ' . $name . ($value !== false ? '="' . $escaped . '"' : '');
+        }
+        return $new_tag . ($unpaired_slash ? '/>' : '>') . $extra_html;
+    }, $_response_body);
+    if ($rewritten === null) throw new RuntimeException('Unable to rewrite upstream document');
+    return $rewritten;
 }
-if(preg_match('/facebook\.com[.]?$/', $_url_parts['host']) && $_content_type == 'application/xhtml+xml') {
-	$_content_type = 'text/html';
-	$_response_headers['content-type'] = $_content_type.'; charset=utf-8';
-}
-    if ($_flags['include_form'] && !isset($_GET['nf']))
-    {
-        // PHProxy top bar + inline management panel injected into proxied pages.
-        // The bar is a self-contained id-scoped <style> island (`all:initial`).
-        // The panel uses the regular index.css loaded via <link>; that loads it
-        // into the proxied page's global CSS scope which can in rare cases
-        // clash with the host page's class names — we accept the trade-off
-        // because the alternative is duplicating ~500 lines of CSS here.
-        $_url_safe       = htmlspecialchars($_url, ENT_QUOTES);
-        $_up_url         = $_script_url . '?' . $_config['url_var_name'] . '=' . encode_url($_url_parts['prev_dir']);
-        $_up_url_safe    = htmlspecialchars($_up_url, ENT_QUOTES);
-        $_home_safe      = htmlspecialchars($_script_base, ENT_QUOTES);
-        $_action_safe    = htmlspecialchars($_script_url, ENT_QUOTES);
-        $_url_var_safe   = htmlspecialchars($_config['url_var_name']);
-        $_current_proxy_url  = $_script_url . '?' . $_config['url_var_name'] . '=' . encode_url($_url);
-        $_current_proxy_safe = htmlspecialchars($_current_proxy_url, ENT_QUOTES);
-        // The panel uses a *scoped* stylesheet (every selector prefixed with
-        // #phproxy-panel) so loading it on the proxied page can't rewrite the
-        // host page's elements. Loading index.css here instead would leak
-        // global rules like `* { box-sizing }` and `body { font }` onto the
-        // proxied content.
-        // Bust the browser cache on every release — the version string is
-        // bumped in the file's $_version line, and that string travels with
-        // the URL so the browser fetches the new CSS instead of using a
-        // stale Cache-Control'd copy from a previous release.
-        $_css_link_safe  = htmlspecialchars($_script_base . '?asset=panel.css&v=' . $_version, ENT_QUOTES);
 
-        // Panel open/active-tab state — set by the dispatcher right after each
-        // save action so the panel re-opens on the same tab the user just
-        // edited. Self-destructing: we clear the cookie after reading it.
-        $_panel_tab_hint = isset($_COOKIE['phproxy-panel-tab']) ? (string) $_COOKIE['phproxy-panel-tab'] : '';
-        $_panel_open     = $_panel_tab_hint !== '';
-        $_panel_active_tab = in_array($_panel_tab_hint, ['options','cookies','headers','response'], true)
-            ? $_panel_tab_hint
-            : 'cookies';
-        if ($_panel_tab_hint !== '') {
-            setcookie('phproxy-panel-tab', '', time() - 3600, '/');
-        }
-
-        // Response-headers list for the new Trace tab (read-only).
-        $_panel_response_pairs = [];
-        foreach ($_response_keys as $_kl => $_ko) {
-            if (!isset($_response_headers[$_kl])) continue;
-            foreach ((array) $_response_headers[$_kl] as $_rv) {
-                $_panel_response_pairs[] = [$_ko, $_rv];
-            }
-        }
-
-        // Parse the outgoing request we just sent so the user can see the
-        // exact wire-form headers (method, path, Host, User-Agent, Cookie,
-        // any custom hdr_* entries we forwarded, etc.).
-        $_panel_request_pairs = [];
-        $_panel_request_line  = '';
-        $_req_lines = explode("\r\n", $_request_headers);
-        $_first = true;
-        foreach ($_req_lines as $_rl) {
-            // Stop at the empty line (end of headers; body follows for POSTs)
-            if ($_rl === '') break;
-            if ($_first) {
-                // Request line: "METHOD /path?query HTTP/1.0"
-                $_panel_request_line = $_rl;
-                $_first = false;
-                continue;
-            }
-            $_colon = strpos($_rl, ':');
-            if ($_colon === false) {
-                $_panel_request_pairs[] = [$_rl, ''];
-            } else {
-                $_panel_request_pairs[] = [substr($_rl, 0, $_colon), ltrim(substr($_rl, $_colon + 1))];
-            }
-        }
-
-        // Cookies + headers in the structure the shared panel template expects
-        $_panel_b = phproxy_panel_buckets();
-        $GLOBALS['_visible_cookies'] = $_panel_b['cookies'];
-        $GLOBALS['_custom_headers']  = $_panel_b['headers'];
-        $GLOBALS['_show_raw_values'] = !empty($_COOKIE['phproxy-show-raw']);
-        $GLOBALS['_ua_presets']      = phproxy_ua_presets();
-
-        $_bar_css = <<<CSS
-#phproxy-bar{all:initial;display:block;position:sticky;top:0;z-index:2147483647;box-sizing:border-box;width:100%;margin:0;padding:8px 12px;background:#ffffff;color:#0f172a;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;border-bottom:1px solid #e2e6ec;}
-#phproxy-bar[data-theme="dark"]{background:#0f172a;color:#f1f5f9;border-bottom-color:#334155;}
-#phproxy-bar *{box-sizing:border-box;font:inherit;color:inherit;}
-#phproxy-bar .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}
-#phproxy-bar input.url{flex:1 1 320px;min-width:0;padding:6px 10px;background:#f8fafc;color:#0f172a;border:1px solid #e2e6ec;border-radius:6px;}
-#phproxy-bar[data-theme="dark"] input.url{background:#1e293b;color:#f1f5f9;border-color:#334155;}
-#phproxy-bar input.url:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.18);}
-#phproxy-bar[data-theme="dark"] input.url:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25);}
-#phproxy-bar button.go{padding:6px 14px;background:#2563eb;color:#fff;border:0;border-radius:6px;font:600 13px inherit;cursor:pointer;}
-#phproxy-bar button.go:hover{background:#1d4ed8;}
-#phproxy-bar[data-theme="dark"] button.go{background:#3b82f6;}
-#phproxy-bar[data-theme="dark"] button.go:hover{background:#60a5fa;}
-#phproxy-bar .icon{cursor:pointer;padding:6px;color:inherit;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;}
-#phproxy-bar .icon:hover{background:rgba(0,0,0,.06);}
-#phproxy-bar[data-theme="dark"] .icon:hover{background:rgba(255,255,255,.08);}
-#phproxy-bar .icon svg{width:16px;height:16px;display:block;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
-#phproxy-bar label.gear{margin-left:auto;}
-#phproxy-panel-toggle{position:absolute !important;left:-9999px !important;width:0 !important;height:0 !important;opacity:0 !important;pointer-events:none !important;}
-CSS;
-
-        $_gear = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
-        $_home_icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10h14V10"/></svg>';
-
-        // Build the inline tabs panel via the shared template function.
-        // Proxied pages hide IP/Port/DNS — those are host-level utilities.
-        // SSL stays visible (and pre-fills with the current page's host)
-        // only when the page is HTTPS, since that's the only time it's
-        // meaningful for the current context.
-        $_is_https      = !empty($_url_parts['scheme']) && strtolower($_url_parts['scheme']) === 'https';
-        $_cert_host_now = $_is_https ? (string) ($_url_parts['host'] ?? '') : '';
-        $_cert_port_now = $_is_https ? (int)    ($_url_parts['port'] ?? 443) : 0;
-        ob_start();
-        phproxy_render_panel_tabs(
-            return_to:           $_current_proxy_url,
-            show_response:       true,
-            response_pairs:      $_panel_response_pairs,
-            request_pairs:       $_panel_request_pairs,
-            request_line:        $_panel_request_line,
-            active_tab:          $_panel_active_tab,
-            form_id:             '',
-            show_cli:            true,
-            cli_url:             $_url,
-            cli_method:          $_request_method,
-            cli_headers:         $_panel_request_pairs,
-            cli_body:            (string) ($_post_body ?? ''),
-            cli_api_url:         $_script_url . '?api=fetch',
-            show_network:        true,
-            network_entries:     $_SESSION['phproxy_network'] ?? [],
-            network_current_url: $_url,
-            show_netchecks:      false,
-            show_cert:           $_is_https,
-            cert_host:           $_cert_host_now,
-            cert_port:           $_cert_port_now,
-            cert_autorun:        $_is_https
-        );
-        $_panel_inner_html = ob_get_clean();
-
-        // Compose the entire injection: bar + (hidden) toggle checkbox + panel
-        $_netcheck_js_safe = htmlspecialchars($_script_base . '?asset=netcheck.js&v=' . $_version, ENT_QUOTES);
-        $_url_form = '<style id="phproxy-bar-style">' . $_bar_css . '</style>'
-            . '<link rel="stylesheet" href="' . $_css_link_safe . '"/>'
-            . '<script src="' . $_netcheck_js_safe . '" defer></script>'
-            . '<input type="checkbox" id="phproxy-panel-toggle"' . ($_panel_open ? ' checked' : '') . '/>'
-            . '<div id="phproxy-bar">'
-            .   '<form class="row" method="post" action="' . $_action_safe . '">'
-            .     '<a class="icon home" href="' . $_home_safe . '" title="PHProxy home" aria-label="PHProxy home">' . $_home_icon . '</a>'
-            .     '<input class="url" id="____' . $_url_var_safe . '" type="text" name="' . $_url_var_safe . '" value="' . $_url_safe . '"/>'
-            .     '<button class="go" type="submit" name="go">Go</button>'
-            .     '<label class="icon gear" for="phproxy-panel-toggle" title="Open settings panel" aria-label="Open settings panel">' . $_gear . '</label>'
-            .   '</form>'
-            . '</div>'
-            . '<div id="phproxy-panel" role="dialog" aria-label="PHProxy settings">'
-            .   '<div class="panel-inner">'
-            .     '<div class="panel-head">'
-            .       '<h2>Settings</h2>'
-            .       '<label class="close" for="phproxy-panel-toggle">Close</label>'
-            .     '</div>'
-            .     $_panel_inner_html
-            .     '<div class="panel-refresh">'
-            .       '<small>Saves apply on click and reload this URL automatically.</small>'
-            .       '<a class="button-submit" href="' . $_current_proxy_safe . '">Refresh page</a>'
-            .     '</div>'
-            .   '</div>'
-            . '</div>'
-            . "<script>(function(){"
-            .   "var theme='light';"
-            .   "try{var s=localStorage.getItem('phproxy-theme');"
-            .     "if(s==='dark'||s==='light')theme=s;"
-            .     "else if(matchMedia('(prefers-color-scheme: dark)').matches)theme='dark';"
-            .   "}catch(e){}"
-            .   "var bar=document.getElementById('phproxy-bar');"
-            .   "var pnl=document.getElementById('phproxy-panel');"
-            .   "if(bar)bar.setAttribute('data-theme',theme);"
-            .   "if(pnl)pnl.setAttribute('data-theme',theme);"
-            .   "var sel=document.getElementById('ua-preset');"
-            .   "var inp=document.getElementById('ua-input');"
-            .   "if(sel&&inp){sel.addEventListener('change',function(){if(sel.value==='__custom__'){inp.focus();inp.select();}else{inp.value=sel.value;}});}"
-            .   "document.querySelectorAll('.cli-copy').forEach(function(btn){"
-            .     "btn.addEventListener('click',function(){"
-            .       "var t=document.getElementById(btn.dataset.target);"
-            .       "if(!t)return;"
-            .       "var text=t.textContent;"
-            .       "var done=function(){var orig=btn.textContent;btn.textContent='Copied!';setTimeout(function(){btn.textContent=orig;},1500);};"
-            .       "if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done,done);}else{"
-            .         "var ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(e){}document.body.removeChild(ta);"
-            .       "}"
-            .     "});"
-            .   "});"
-            .   "var nbase=" . json_encode($_script_base, JSON_UNESCAPED_SLASHES) . ";"
-            .   "function renderPort(out,s){var L=[s.host+'   '+s.results.length+'/'+s.count+' port'+(s.count===1?'':'s')+'   open: '+s.open+'   closed: '+s.closed+(s.done?'   ('+(s.duration_ms||0)+' ms)':'   …scanning'),''];"
-            .     "s.results.forEach(function(r){var ps=String(r.port);while(ps.length<s.maxPort)ps=' '+ps;L.push(ps+(r.reachable?'  OPEN    '+r.latency_ms+' ms':'  CLOSED  '+(r.error||'unreachable')+'   '+(r.latency_ms||0)+' ms'));});"
-            .     "out.textContent=L.join('\\n');}"
-            .   "async function streamPort(f,out){var fd=new FormData(f),p=new URLSearchParams();p.set('api','portcheck');p.set('stream','1');fd.forEach(function(v,k){p.set(k,v);});"
-            .     "out.hidden=false;out.className='netcheck-result busy';out.textContent='Connecting…';"
-            .     "var resp=await fetch(nbase+'?'+p.toString(),{headers:{'Accept':'application/x-ndjson'}});"
-            .     "if(!resp.ok){var m='HTTP '+resp.status;try{var j=await resp.json();if(j&&j.error)m='ERROR  '+j.error;}catch(e){}out.className='netcheck-result err';out.textContent=m;return;}"
-            .     "var rdr=resp.body.getReader(),dec=new TextDecoder(),buf='';"
-            .     "var s={host:'',count:0,open:0,closed:0,results:[],maxPort:0,done:false,duration_ms:0};"
-            .     "while(true){var c=await rdr.read();if(c.done)break;buf+=dec.decode(c.value,{stream:true});var n;"
-            .       "while((n=buf.indexOf('\\n'))>=0){var ln=buf.slice(0,n);buf=buf.slice(n+1);if(!ln.trim())continue;var e;try{e=JSON.parse(ln);}catch(x){continue;}"
-            .         "if(e.event==='start'){s.host=e.host;s.count=e.count;(e.ports||[]).forEach(function(pp){var l=String(pp).length;if(l>s.maxPort)s.maxPort=l;});renderPort(out,s);}"
-            .         "else if(e.event==='result'){s.results.push(e);if(e.reachable)s.open++;else s.closed++;renderPort(out,s);}"
-            .         "else if(e.event==='end'){s.done=true;s.duration_ms=e.duration_ms;var ao=s.open>0,ac=s.closed>0;out.className='netcheck-result '+(ao&&!ac?'ok':(ao?'warn':'err'));renderPort(out,s);}"
-            .       "}"
-            .     "}}"
-            .   "function escH(s){return String(s==null?'':s).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}"
-            .   "function ipCard(role,d){"
-            .     "if(!d||!d.ip)return '<div class=\"ipinfo-card\"><div class=\"ipinfo-card-title\">'+role+'</div><div class=\"ipinfo-row\"><span class=\"k\">(not available)</span></div></div>';"
-            .     "var fam=d.family?'<span class=\"ipinfo-family\">'+d.family+'</span>':'';"
-            .     "var priv=d.is_private?'<span class=\"ipinfo-private\">private</span>':'';"
-            .     "var r=d.reverse?'<div class=\"ipinfo-row\"><span class=\"k\">Reverse</span><span class=\"v\">'+escH(d.reverse)+'</span></div>':'';"
-            .     "return '<div class=\"ipinfo-card\"><div class=\"ipinfo-card-title\">'+role+(priv?'  '+priv:'')+'</div><div class=\"ipinfo-ip\">'+escH(d.ip)+fam+'</div>'+r+'</div>';"
-            .   "}"
-            .   "function ipKv(title,o){if(!o)return '';var r='';Object.keys(o).forEach(function(k){var v=o[k];if(v==null)return;var lb=k.replace(/_/g,' ');r+='<div class=\"k\">'+lb+'</div><div class=\"v'+(v===''?' empty':'')+'\">'+(v===''?'—':escH(v))+'</div>';});return r?('<div class=\"ipinfo-section\"><h4>'+title+'</h4><div class=\"ipinfo-grid\">'+r+'</div></div>'):'';}"
-            .   "var ipT=document.querySelector('[data-ipinfo-target]');"
-            .   "if(ipT){(async function(){"
-            .     "try{var r=await fetch(nbase+'?api=ipinfo');var j=await r.json();"
-            .       "if(j.ok===false){ipT.innerHTML='<div class=\"ipinfo-loading\">Failed: '+escH(j.error||'unknown')+'</div>';return;}"
-            .       "ipT.innerHTML=ipCard('Client',j.client)+ipCard('Server',j.server)+ipCard('Outgoing',j.outgoing);"
-            .       "var ex='';if(j.forwarded&&j.forwarded.length){var hops=j.forwarded.map(function(h){return h.ip;}).join(' → ');ex+='<div class=\"ipinfo-section\"><h4>X-Forwarded-For chain</h4><div class=\"ipinfo-grid\"><div class=\"k\">hops</div><div class=\"v\">'+escH(hops)+'</div></div></div>';}"
-            .       "ex+=ipKv('Request',j.request);ex+=ipKv('Host',j.host);"
-            .       "ipT.insertAdjacentHTML('afterend',ex);"
-            .     "}catch(e){ipT.innerHTML='<div class=\"ipinfo-loading\">Network error: '+escH(e&&e.message?e.message:e)+'</div>';}"
-            .   "})();}"
-            .   "document.querySelectorAll('form[data-ipinfo-lookup]').forEach(function(f){"
-            .     "var o=f.querySelector('.netcheck-result'),b=f.querySelector('button[type=\"submit\"]');"
-            .     "f.addEventListener('submit',async function(ev){ev.preventDefault();var ip=f.querySelector('input[name=\"ip\"]').value.trim();if(!ip)return;o.hidden=false;o.className='netcheck-result busy';o.textContent='Looking up '+ip+'…';b.disabled=true;"
-            .       "try{var r=await fetch(nbase+'?api=ipinfo&ip='+encodeURIComponent(ip));var j=await r.json();"
-            .         "if(j.ok===false){o.className='netcheck-result err';o.textContent='ERROR  '+(j.error||'request failed');return;}"
-            .         "var L=j.lookup||{},lines=[L.ip+'   '+L.family+(L.is_private?'   (private)':'')];"
-            .         "if(L.reverse)lines.push('reverse:    '+L.reverse);"
-            .         "lines.push('','lookup time: '+(j.duration_ms||0)+' ms');"
-            .         "o.className='netcheck-result ok';o.textContent=lines.join('\\n');"
-            .       "}catch(e){o.className='netcheck-result err';o.textContent='Network error: '+(e&&e.message?e.message:e);}finally{b.disabled=false;}"
-            .     "});"
-            .   "});"
-            .   "document.querySelectorAll('form[data-netcheck]').forEach(function(f){"
-            .     "var kind=f.getAttribute('data-netcheck');"
-            .     "var out=f.querySelector('.netcheck-result');"
-            .     "var btn=f.querySelector('button[type=\"submit\"]');"
-            .     "f.addEventListener('submit',async function(ev){"
-            .       "ev.preventDefault();btn.disabled=true;"
-            .       "try{"
-            .         "if(kind==='portcheck'){await streamPort(f,out);return;}"
-            .         "var fd=new FormData(f),p=new URLSearchParams();p.set('api',kind);"
-            .         "fd.forEach(function(v,k){p.set(k,v);});"
-            .         "out.hidden=false;out.className='netcheck-result busy';out.textContent='Running…';"
-            .         "var r=await fetch(nbase+'?'+p.toString(),{headers:{'Accept':'application/json'}});"
-            .         "var j=await r.json();"
-            .         "if(j.ok===false){out.className='netcheck-result err';out.textContent='ERROR  '+(j.error||'request failed')+(j.host?'\\nhost: '+j.host:'');return;}"
-            .         "if(kind==='dns'){"
-            .           "if(!j.records||!j.records.length){out.className='netcheck-result warn';out.textContent='No '+j.type+' records for '+j.host+'  ('+j.duration_ms+' ms)';return;}"
-            .           "var L=[j.host+'  '+j.type+'  '+j.records.length+' record(s)  ('+j.duration_ms+' ms)',''];"
-            .           "j.records.forEach(function(r){var k=r.type||j.type,v=r.ip||r.ipv6||r.target||r.txt||r.value||r.mname||(r.tag?r.tag+' \"'+r.value+'\"':JSON.stringify(r));L.push(k+'  '+v+(r.ttl!=null?'   ttl '+r.ttl:''));});"
-            .           "out.className='netcheck-result ok';out.textContent=L.join('\\n');"
-            .         "} else if(kind==='cert'){"
-            .           "var d=(j.leaf&&j.leaf.days_left);"
-            .           "out.className='netcheck-result cert-result '+(d!=null&&d<0?'err':(d!=null&&d<30?'warn':'ok'));"
-            .           "if(window.phproxyFmtCertHtml){out.innerHTML=window.phproxyFmtCertHtml(j);if(window.phproxyBindCertCopy)window.phproxyBindCertCopy(out);}"
-            .           "else{out.textContent='Cert renderer still loading — try again in a moment.';}"
-            .         "}"
-            .       "}catch(e){out.className='netcheck-result err';out.textContent='Network error: '+(e&&e.message?e.message:e);}finally{btn.disabled=false;}"
-            .     "});"
-            .   "});"
-            .   /* SSL tab — auto-run the cert check on first activation
-               when the form is pre-filled with the current page's host. */
-              "(function(){"
-            .     "var tab=document.getElementById('tab-cert');"
-            .     "var f=document.querySelector('form[data-netcheck=\"cert\"][data-autorun=\"1\"]');"
-            .     "if(!tab||!f)return;"
-            .     "function trigger(){"
-            .       "if(f.dataset.ran)return;f.dataset.ran='1';"
-            .       "if(f.requestSubmit)f.requestSubmit();"
-            .       "else f.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));"
-            .     "}"
-            .     "if(tab.checked)trigger();"
-            .     "tab.addEventListener('change',function(){if(tab.checked)trigger();});"
-            .   "})();"
-            . "})();</script>";
-
-        $_response_body = preg_replace('#\<\s*body(.*?)\>#si', "$0\n$_url_form" , $_response_body, 1);
-    }
-}
-$_response_keys['content-disposition'] = 'Content-Disposition';
-$_response_headers['content-disposition'][0] = empty($_content_disp) ? ($_content_type == 'application/octet_stream' ? 'attachment' : 'inline') . '; filename="' . $_url_parts['file'] . '"' : $_content_disp;
-$_response_keys['content-length'] = 'Content-Length';
-$_response_headers['content-length'][0] = strlen($_response_body);
-$_response_keys['proxx-orig-url'] = 'Proxx-Orig-URL';
-$_response_headers['proxx-orig-url'][0] = $_url;
-$_response_headers   = array_filter($_response_headers);
-$_response_keys      = array_filter($_response_keys);
-
-header(array_shift($_response_keys));
-array_shift($_response_headers);
-
-foreach ($_response_headers as $name => $array)
+/** A browsing-only token cannot authorize any management action. */
+function phproxy_navigation_token(): string
 {
-    foreach ($array as $value)
-    {
-        $h_name = $_response_keys[$name];
-        if(strtolower($h_name) != 'content-security-policy' &&
-         strtolower($h_name) != 'content-security-policy-report-only' &&
-         strtolower($h_name) != 'x-xss-protection') {
-            header($h_name . ': ' . $value, false);
-        }
+    return hash_hmac('sha256', 'phproxy-browse-url', phproxy_csrf_token());
+}
+
+/** Decode the fetched document before placing it in a UTF-8 srcdoc attribute. */
+function phproxy_html_utf8(string $html, string $content_type): string
+{
+    $charset = '';
+    // HTML gives a Unicode BOM precedence over HTTP and meta declarations.
+    // Strip it before converting so the srcdoc string starts with its markup.
+    if (str_starts_with($html, "\xEF\xBB\xBF")) {
+        $charset = 'UTF-8';
+        $html = substr($html, 3);
+    } elseif (str_starts_with($html, "\xFF\xFE")) {
+        $charset = 'UTF-16LE';
+        $html = substr($html, 2);
+    } elseif (str_starts_with($html, "\xFE\xFF")) {
+        $charset = 'UTF-16BE';
+        $html = substr($html, 2);
+    } elseif (preg_match('/charset\s*=\s*["\']?([a-z0-9._-]+)/i', $content_type, $match)) {
+        $charset = $match[1];
+    } elseif (preg_match('/<meta\b[^>]*charset\s*=\s*["\']?([a-z0-9._-]+)/i', substr($html, 0, 4096), $match)) {
+        $charset = $match[1];
+    }
+    if ($charset === '') $charset = mb_check_encoding($html, 'UTF-8') ? 'UTF-8' : 'Windows-1252';
+    try {
+        return mb_convert_encoding($html, 'UTF-8', $charset);
+    } catch (ValueError $e) {
+        return mb_convert_encoding($html, 'UTF-8', 'UTF-8');
     }
 }
 
-echo $_response_body;
+/** The trusted controls and upstream document occupy separate browsing contexts. */
+function phproxy_browsing_bar(string $html, string $settings_url, string $current_url, ?string $navigation_token = null,
+    string $panel_html = '', bool $allow_scripts = false): string
+{
+    $escape = static fn(string $value): string => htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $home = $escape($settings_url);
+    $current = $escape($current_url);
+    $edit = $escape($settings_url . '?__iv=' . rawurlencode($current_url));
+    $panel_css = $escape($settings_url . '?asset=panel.css');
+    $netcheck_js = $escape($settings_url . '?asset=netcheck.js');
+    $sandbox = 'allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation'
+        . ($allow_scripts ? ' allow-scripts' : ' allow-same-origin');
+    $open = isset($_GET['panel']) && in_array($_GET['panel'], ['options', 'cookies', 'headers', 'network', 'response', 'cli', 'ip', 'dns', 'port', 'cert'], true);
+    $title = '';
+    if (preg_match('#<title\b[^>]*>(.*?)</title>#is', $html, $match)) {
+        $title = trim(html_entity_decode(strip_tags($match[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
+    $document = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<title>' . $escape($title !== '' ? $title : 'PHProxy') . '</title>'
+        . '<link rel="stylesheet" href="' . $panel_css . '">'
+        . '<script src="' . $netcheck_js . '" defer></script>';
+    $document .= <<<'HTML'
+<style>
+html,body{width:100%;height:100%;margin:0;overflow:hidden;}
+body{display:grid;grid-template-rows:auto minmax(0,1fr);height:100vh;height:100dvh;}
+#phproxy-navigation{box-sizing:border-box;width:100%;margin:0;padding:8px 12px;background:#fff;color:#172033;border-bottom:1px solid #dbe2ea;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+#phproxy-navigation .phproxy-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0;padding:0;}
+#phproxy-navigation .phproxy-url{box-sizing:border-box;flex:1 1 220px;min-width:0;padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;color:#172033;font:inherit;}
+#phproxy-navigation .phproxy-link{display:inline-block;cursor:pointer;padding:7px 6px;color:#1d4ed8;background:none;border:0;font:inherit;text-decoration:none;white-space:nowrap;}
+#phproxy-navigation .phproxy-go{cursor:pointer;padding:8px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;font:inherit;}
+#phproxy-navigation :focus-visible{outline:2px solid #2563eb;outline-offset:2px;}
+#phproxy-viewport{position:relative;min-height:0;min-width:0;overflow:hidden;}
+#phproxy-page{display:block;border:0;width:100%;height:100%;background:#fff;}
+#phproxy-panel-toggle{display:none;}
+#phproxy-panel{position:absolute;inset:0;display:none;}
+#phproxy-panel-toggle:checked ~ #phproxy-viewport #phproxy-panel{display:block;}
+</style></head><body>
+HTML;
+    $document .= '<input type="checkbox" id="phproxy-panel-toggle"' . ($open ? ' checked' : '') . '>'
+        . '<header id="phproxy-navigation" aria-label="PHProxy browsing bar">';
+    $document .= $navigation_token !== null
+        ? '<form class="phproxy-row" method="post" action="' . $home . '">'
+        : '<div class="phproxy-row">';
+    $document .= '<a class="phproxy-link" href="' . $edit . '" aria-label="PHProxy home">PHProxy</a>'
+        . '<input class="phproxy-url" type="text" aria-label="Current page URL" name="phproxy_browse_url" value="' . $current . '" autocomplete="off"'
+        . ($navigation_token !== null ? ' required' : ' readonly') . '>';
+    if ($navigation_token !== null) {
+        $document .= '<input type="hidden" name="phproxy_navigation_token" value="' . $escape($navigation_token) . '">'
+            . '<button class="phproxy-go" type="submit">Go</button>';
+    } else {
+        $document .= '<a class="phproxy-link" href="' . $edit . '">Change URL</a>';
+    }
+    $document .= '<button class="phproxy-link" id="phproxy-settings-button" type="button" aria-controls="phproxy-panel" aria-expanded="' . ($open ? 'true' : 'false') . '">Settings</button>'
+        . ($navigation_token !== null ? '</form>' : '</div>') . '</header>'
+        . '<main id="phproxy-viewport"><iframe id="phproxy-page" title="Proxied page" sandbox="' . $sandbox . '" referrerpolicy="no-referrer" srcdoc="' . $escape($html) . '"></iframe>'
+        . '<section id="phproxy-panel" role="region" aria-label="PHProxy settings"><div class="panel-inner">'
+        . '<div class="panel-head"><h2>Settings</h2><button type="button" class="close" id="phproxy-settings-close">Close</button></div>'
+        . $panel_html . '</div></section></main>'
+        . '<script>' . phproxy_ui_js() . '</script></body></html>';
+    return $document;
+}
+
+/** Only trusted proxy controls live in the outer document; the page is sandboxed separately. */
+function phproxy_browsing_shell_headers(): void
+{
+    phproxy_untrusted_response_headers(false);
+    header('Content-Type: text/html; charset=UTF-8');
+    header('Content-Security-Policy: ' . phproxy_browsing_shell_policy());
+}
+
+function phproxy_browsing_shell_policy(): string
+{
+    return "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+}
+
+function phproxy_content_policy(bool $allow_scripts = false): string
+{
+    // Session-bound encrypted stylesheet/font URLs need same-origin cookies.
+    // Preserve that origin only while both CSP and the sandbox block scripts.
+    // Script opt-in always gets an opaque origin; never combine both grants.
+    return 'sandbox allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation'
+        . ($allow_scripts ? ' allow-scripts' : ' allow-same-origin')
+        . "; object-src 'none'; base-uri 'none'"
+        . ($allow_scripts ? '' : "; script-src 'none'");
+}
+
+function phproxy_untrusted_response_headers(bool $allow_scripts = false): void
+{
+    foreach (['Access-Control-Allow-Origin', 'Access-Control-Allow-Credentials', 'Access-Control-Allow-Headers',
+              'Access-Control-Allow-Methods', 'Content-Security-Policy-Report-Only', 'Refresh', 'Link',
+              'Clear-Site-Data', 'Service-Worker-Allowed', 'Report-To', 'Reporting-Endpoints', 'NEL',
+              'Strict-Transport-Security', 'Alt-Svc', 'Proxx-Orig-URL',
+              'Cross-Origin-Resource-Policy', 'Cross-Origin-Embedder-Policy'] as $name) header_remove($name);
+    header('Content-Security-Policy: ' . phproxy_content_policy($allow_scripts));
+    header('X-Content-Type-Options: nosniff');
+    header('Referrer-Policy: no-referrer');
+    header('Cache-Control: private, no-store');
+    header('Cross-Origin-Opener-Policy: same-origin');
+}
 
 // --- TEMPLATES (formerly files/php/index.inc.php and _panel_tabs.inc.php) ---
 
-function phproxy_render_entry_form(array $data): void {
-
-$_show_raw_values = !empty($_COOKIE['phproxy-show-raw']);
-$_panel_buckets   = phproxy_panel_buckets();
-$_visible_cookies = $_panel_buckets['cookies'];
-$_custom_headers  = $_panel_buckets['headers'];
-$_current_ua      = isset($_COOKIE['userAgent']) ? $_COOKIE['userAgent'] : '';
-$_ua_presets      = phproxy_ua_presets();
-
-$_active_tab = isset($_GET['tab']) ? (string) $_GET['tab'] : 'options';
-$_valid_tabs = ['options' => 1, 'cookies' => 1, 'headers' => 1, 'ip' => 1, 'port' => 1, 'dns' => 1, 'cert' => 1, 'cli' => 1];
-if (!isset($_valid_tabs[$_active_tab])) $_active_tab = 'options';
-?>
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <title><?php echo htmlspecialchars($GLOBALS['_config']['site_name']); ?></title>
-    <link rel="stylesheet" href="?asset=index.css&amp;v=<?php echo htmlspecialchars($GLOBALS['_version']); ?>"/>
-    <script src="?asset=netcheck.js&amp;v=<?php echo htmlspecialchars($GLOBALS['_version']); ?>" defer></script>
-    <script>
-    (function () {
-        var s = null;
-        try { s = localStorage.getItem('phproxy-theme'); } catch (e) {}
-        if (s === 'dark' || s === 'light') {
-            document.documentElement.setAttribute('data-theme', s);
-        }
-    })();
-    </script>
-</head>
-<body>
-<div class="page">
-    <header class="appbar">
-        <h1><?php echo htmlspecialchars($GLOBALS['_config']['site_name']); ?><span class="dot">.</span></h1>
-        <button type="button" class="theme-toggle" aria-label="Toggle colour theme" title="Toggle colour theme">
-            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="12" cy="12" r="4"/>
-                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
-            </svg>
-            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-            </svg>
-        </button>
-    </header>
-
-<?php if ($data['category'] != 'auth'): ?>
-    <form id="proxy-main-form" method="post" action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>">
-        <div class="card">
-            <div class="form-row url-row">
-                <input class="url-input" type="text" name="<?php echo htmlspecialchars($GLOBALS['_config']['url_var_name']) ?>" value="<?php echo isset($_GET[$GLOBALS['_config']['url_var_name']]) ? htmlspecialchars(decode_url($_GET[$GLOBALS['_config']['url_var_name']])) : (isset($_GET['__iv']) ? htmlspecialchars($_GET['__iv']) : ''); ?>" placeholder="https://www.example.com/" required autofocus autocomplete="off"/>
-                <button class="button-submit" type="submit">Go</button>
-            </div>
-<?php
-switch ($data['category']) {
-    case 'error':
-        echo '            <p class="error">';
-
-        switch ($data['group']) {
-            case 'url':
-                echo '<b>URL Error (' . htmlspecialchars($data['error']) . ')</b>: ';
-                switch ($data['type']) {
-                    case 'internal':
-                        $message = 'Failed to connect to the specified host. '
-                            . 'Possible problems are that the server was not found, the connection timed out, or the connection refused by the host. '
-                            . 'Try connecting again and check if the address is correct.';
-                        break;
-                    case 'external':
-                        switch ($data['error']) {
-                            case 1:
-                                $message = 'The URL you\'re attempting to access is blacklisted by this server. Please select another URL.';
-                                break;
-                            case 2:
-                                $message = 'The URL you entered is malformed. Please check whether you entered the correct URL or not.';
-                                break;
-                        }
-                        break;
-                }
-                break;
-            case 'resource':
-                echo '<b>Resource Error:</b> ';
-                switch ($data['type']) {
-                    case 'file_size':
-                        $message = 'The file your are attempting to download is too large.<br/>'
-                        . 'Maxiumum permissible file size is <b>' . number_format($GLOBALS['_config']['max_file_size'] / 1048576, 2) . ' MB</b><br/>'
-                        . 'Requested file size is <b>' . number_format($GLOBALS['_content_length'] / 1048576, 2) . ' MB</b>';
-                        break;
-                    case 'hotlinking':
-                        $message = 'It appears that you are trying to access a resource through this proxy from a remote Website.<br/>'
-                            . 'For security reasons, please use the form below to do so.';
-                        break;
-                }
-                break;
-        }
-
-        echo 'An error has occured while trying to browse through the proxy. <br/>' . $message . '</p>';
-        break;
+function phproxy_csrf_field(): string
+{
+    return '<input type="hidden" name="csrf_token" value="' . htmlspecialchars(phproxy_csrf_token(), ENT_QUOTES, 'UTF-8') . '"/>';
 }
-?>
-        </div>
-    </form>
-    <?php /* Main URL form ends here. Tabs below have their own per-row forms;
-             Options-tab inputs use form="proxy-main-form" so they ride along
-             on URL submission and persist as the 'flags' cookie. */ ?>
 
-    <?php if (in_array(0, $GLOBALS['_frozen_flags'])): ?>
-    <div class="card">
-<?php
-$GLOBALS['_show_raw_values']  = $_show_raw_values;
-$GLOBALS['_visible_cookies']  = $_visible_cookies;
-$GLOBALS['_custom_headers']   = $_custom_headers;
-$GLOBALS['_ua_presets']       = $_ua_presets;
-phproxy_render_panel_tabs(
-    return_to:     '',
-    show_response: false,
-    active_tab:    $_active_tab,
-    form_id:       'proxy-main-form'
-);
-?>
-    </div>
-    <?php endif; ?>
-<?php elseif ($data['category'] == 'auth'): ?>
-    <form class="auth" method="post" action="<?php echo htmlspecialchars($_SERVER['REQUEST_URI']); ?>">
-        <div class="card main-auth-box">
-            <div class="form-title-row">
-                <h2 class="auth-header">Authentication Required</h2>
-            </div>
-            <input type="hidden" name="<?php echo htmlspecialchars($GLOBALS['_config']['basic_auth_var_name']) ?>" value="<?php echo base64_encode($data['realm']) ?>"/>
-            <div class="form-row">
-                <label>
-                    <span>Username</span>
-                    <input type="text" name="username" placeholder="Username" autocomplete="username"/>
-                </label>
-            </div>
-            <div class="form-row">
-                <label>
-                    <span>Password</span>
-                    <input type="password" name="password" placeholder="Password" autocomplete="current-password"/>
-                </label>
-            </div>
-            <div class="tab-actions">
-                <button class="button-submit" type="submit">Login</button>
-                <a class="button-cancel" href="index.php<?php echo '?__iv=' . rawurlencode($GLOBALS['_url']); ?>">Cancel</a>
-            </div>
-            <?php if (!empty($_POST['username']) || !empty($_POST['password'])): ?>
-            <p class="error"><b>Authentication Required: </b>The supplied credentials were unauthorized to access the specified content.</p>
-            <?php else: ?>
-            <p class="info"><b>Authentication Required: </b>Enter your username and password for &quot;<?php echo htmlspecialchars($data['realm']); ?>&quot; on <?php echo htmlspecialchars($GLOBALS['_url_parts']['host']); ?></p>
-            <?php endif; ?>
-        </div>
-    </form>
-<?php endif; ?>
-
-    <p class="footer"><a href="https://github.com/PHProxy/phproxy">PHProxy</a> <?= $GLOBALS['_version']; ?></p>
-</div>
-
-<script>
+/** Shared bindings for the trusted home page and browsing shell. */
+function phproxy_ui_js(): string
+{
+    return <<<'JAVASCRIPT'
 (function () {
+
+    // Cross-page fragments arrive on the outer proxy URL. Forward them to
+    // the already loaded document without adding another history entry.
+    var pageFrame = document.getElementById('phproxy-page');
+    if (pageFrame) {
+        var syncPageFragment = function () {
+            if (!window.location.hash) return;
+            try {
+                var pageDocument = pageFrame.contentDocument;
+                if (pageDocument && pageDocument.URL.split('#')[0] === 'about:srcdoc') {
+                    pageFrame.contentWindow.location.replace('about:srcdoc' + window.location.hash);
+                }
+            } catch (_) {
+                // Script opt-in intentionally isolates the page's origin.
+            }
+        };
+        pageFrame.addEventListener('load', syncPageFragment);
+        window.addEventListener('hashchange', syncPageFragment);
+        syncPageFragment();
+    }
+
+    // The trusted shell uses a checkbox for its settings panel layout.
+    var settingsButton = document.getElementById('phproxy-settings-button');
+    var settingsToggle = document.getElementById('phproxy-panel-toggle');
+    var settingsClose = document.getElementById('phproxy-settings-close');
+    if (settingsButton && settingsToggle) {
+        var syncSettings = function () {
+            settingsButton.setAttribute('aria-expanded', settingsToggle.checked ? 'true' : 'false');
+        };
+        settingsButton.addEventListener('click', function (ev) {
+            ev.preventDefault();
+            settingsToggle.checked = !settingsToggle.checked;
+            syncSettings();
+        });
+        if (settingsClose) {
+            settingsClose.addEventListener('click', function (ev) {
+                ev.preventDefault();
+                settingsToggle.checked = false;
+                syncSettings();
+                settingsButton.focus();
+            });
+        }
+        settingsToggle.addEventListener('change', syncSettings);
+        syncSettings();
+    }
     var root = document.documentElement;
     var btn = document.querySelector('.theme-toggle');
     if (btn) {
@@ -3718,7 +3025,21 @@ phproxy_render_panel_tabs(
         }
     }
     var ipTarget = document.querySelector('[data-ipinfo-target]');
-    if (ipTarget) loadIpinfo(ipTarget);
+    var ipTab = document.getElementById('tab-ip');
+    var ipLoaded = false;
+    function activateIpinfo() {
+        if (!ipTarget || !ipTab || !ipTab.checked || ipLoaded) return;
+        ipLoaded = true;
+        loadIpinfo(ipTarget);
+    }
+    // Bind only: opening a page or settings panel must not issue diagnostics.
+    if (ipTab) ipTab.addEventListener('change', activateIpinfo);
+    document.querySelectorAll('label[for="tab-ip"]').forEach(function (label) {
+        label.addEventListener('click', function () {
+            // Run after the label's default radio-button selection.
+            setTimeout(activateIpinfo, 0);
+        });
+    });
 
     // Custom IP lookup form inside the IP tab
     document.querySelectorAll('form[data-ipinfo-lookup]').forEach(function (form) {
@@ -3756,11 +3077,193 @@ phproxy_render_panel_tabs(
         });
     });
 })();
-</script>
+JAVASCRIPT;
+}
+
+function phproxy_render_entry_form(array $data): void {
+// Finish session reads and form tokens before any HTML reaches the client.
+ob_start();
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+header('Cache-Control: private, no-store');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: no-referrer');
+header('Cross-Origin-Opener-Policy: same-origin');
+
+$_show_raw_values = !empty($_COOKIE['phproxy-show-raw']);
+$_panel_buckets   = phproxy_panel_buckets();
+$_visible_cookies = $_panel_buckets['cookies'];
+$_custom_headers  = $_panel_buckets['headers'];
+$_header_origins  = $_panel_buckets['header_origins'] ?? [];
+$_last_trace      = phproxy_trace_entries();
+$_current_ua      = phproxy_user_agent_setting();
+$_ua_presets      = phproxy_ua_presets();
+
+$_active_tab = isset($_GET['tab']) ? (string) $_GET['tab'] : 'options';
+$_valid_tabs = ['network' => 1, 'response' => 1, 'options' => 1, 'cookies' => 1, 'headers' => 1, 'ip' => 1, 'port' => 1, 'dns' => 1, 'cert' => 1, 'cli' => 1];
+if (!isset($_valid_tabs[$_active_tab])) $_active_tab = 'options';
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title><?php echo htmlspecialchars($GLOBALS['_config']['site_name']); ?></title>
+    <link rel="stylesheet" href="?asset=index.css&amp;v=<?php echo htmlspecialchars($GLOBALS['_version']); ?>"/>
+    <script src="?asset=netcheck.js&amp;v=<?php echo htmlspecialchars($GLOBALS['_version']); ?>" defer></script>
+    <script>
+    (function () {
+        var s = null;
+        try { s = localStorage.getItem('phproxy-theme'); } catch (e) {}
+        if (s === 'dark' || s === 'light') {
+            document.documentElement.setAttribute('data-theme', s);
+        }
+    })();
+    </script>
+</head>
+<body>
+<div class="page">
+    <header class="appbar">
+        <h1><?php echo htmlspecialchars($GLOBALS['_config']['site_name']); ?><span class="dot">.</span></h1>
+        <button type="button" class="theme-toggle" aria-label="Toggle colour theme" title="Toggle colour theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4"/>
+                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+            </svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+        </button>
+    </header>
+
+<?php if ($data['category'] != 'auth'): ?>
+    <form id="proxy-main-form" method="post" action="<?php echo htmlspecialchars($GLOBALS['_script_url']); ?>">
+        <?php echo phproxy_csrf_field(); ?>
+        <div class="card">
+            <div class="form-row url-row">
+                <input class="url-input" type="text" name="<?php echo htmlspecialchars($GLOBALS['_config']['url_var_name']) ?>" value="<?php echo isset($_GET[$GLOBALS['_config']['url_var_name']]) ? htmlspecialchars(decode_url($_GET[$GLOBALS['_config']['url_var_name']])) : (isset($_GET['__iv']) ? htmlspecialchars($_GET['__iv']) : ''); ?>" placeholder="https://www.example.com/" required autofocus autocomplete="off"/>
+                <button class="button-submit" type="submit">Go</button>
+            </div>
+<?php
+switch ($data['category']) {
+    case 'error':
+        echo '            <p class="error">';
+
+        switch ($data['group']) {
+            case 'url':
+                echo '<b>URL Error (' . htmlspecialchars($data['error']) . ')</b>: ';
+                switch ($data['type']) {
+                    case 'internal':
+                        $message = 'Failed to connect to the specified host. '
+                            . 'Possible problems are that the server was not found, the connection timed out, or the connection refused by the host. '
+                            . 'Try connecting again and check if the address is correct.';
+                        break;
+                    case 'external':
+                        switch ($data['error']) {
+                            case 1:
+                                $message = 'The URL you\'re attempting to access is blacklisted by this server. Please select another URL.';
+                                break;
+                            case 2:
+                                $message = 'The URL you entered is malformed. Please check whether you entered the correct URL or not.';
+                                break;
+                        }
+                        break;
+                }
+                break;
+            case 'resource':
+                echo '<b>Resource Error:</b> ';
+                switch ($data['type']) {
+                    case 'file_size':
+                        $message = 'The file your are attempting to download is too large.<br/>'
+                        . 'Maxiumum permissible file size is <b>' . number_format($GLOBALS['_config']['max_file_size'] / 1048576, 2) . ' MB</b><br/>'
+                        . 'Requested file size is <b>' . number_format($GLOBALS['_content_length'] / 1048576, 2) . ' MB</b>';
+                        break;
+                    case 'hotlinking':
+                        $message = 'It appears that you are trying to access a resource through this proxy from a remote Website.<br/>'
+                            . 'For security reasons, please use the form below to do so.';
+                        break;
+                }
+                break;
+        }
+
+        echo 'An error has occured while trying to browse through the proxy. <br/>' . $message . '</p>';
+        break;
+}
+?>
+        </div>
+    </form>
+    <?php /* Main URL form ends here. Tabs below have their own per-row forms;
+             Options-tab inputs use form="proxy-main-form" so they ride along
+             on URL submission and persist as the 'flags' cookie. */ ?>
+
+    <?php if (in_array(0, $GLOBALS['_frozen_flags'])): ?>
+    <div class="card">
+<?php
+$GLOBALS['_show_raw_values']  = $_show_raw_values;
+$GLOBALS['_visible_cookies']  = $_visible_cookies;
+$GLOBALS['_custom_headers']   = $_custom_headers;
+$GLOBALS['_header_origins']   = $_header_origins;
+$GLOBALS['_ua_presets']       = $_ua_presets;
+phproxy_render_panel_tabs(
+    return_to:     '',
+    show_response: !empty($_last_trace),
+    request_pairs: $_last_trace['request_pairs'] ?? [],
+    response_pairs: $_last_trace['response_pairs'] ?? [],
+    request_line: $_last_trace['request_line'] ?? '',
+    cli_url: $_last_trace['url'] ?? '',
+    cli_method: $_last_trace['method'] ?? 'GET',
+    cli_headers: $_last_trace['request_pairs'] ?? [],
+    active_tab:    $_active_tab,
+    form_id:       'proxy-main-form',
+    show_network:  true,
+    network_entries: phproxy_network_entries(),
+    show_cert: getenv('PHPROXY_DIAGNOSTICS') === '1'
+);
+?>
+    </div>
+    <?php endif; ?>
+<?php elseif ($data['category'] == 'auth'): ?>
+    <form class="auth" method="post" action="<?php echo htmlspecialchars($_SERVER['REQUEST_URI']); ?>">
+        <?php echo phproxy_csrf_field(); ?>
+        <div class="card main-auth-box">
+            <div class="form-title-row">
+                <h2 class="auth-header">Authentication Required</h2>
+            </div>
+            <input type="hidden" name="<?php echo htmlspecialchars($GLOBALS['_config']['basic_auth_var_name']) ?>" value="<?php echo base64_encode($data['realm']) ?>"/>
+            <div class="form-row">
+                <label>
+                    <span>Username</span>
+                    <input type="text" name="username" placeholder="Username" autocomplete="username"/>
+                </label>
+            </div>
+            <div class="form-row">
+                <label>
+                    <span>Password</span>
+                    <input type="password" name="password" placeholder="Password" autocomplete="current-password"/>
+                </label>
+            </div>
+            <div class="tab-actions">
+                <button class="button-submit" type="submit">Login</button>
+                <a class="button-cancel" href="<?php echo htmlspecialchars($GLOBALS['_script_url']); ?><?php echo '?__iv=' . rawurlencode($GLOBALS['_url']); ?>">Cancel</a>
+            </div>
+            <?php if (!empty($_POST['username']) || !empty($_POST['password'])): ?>
+            <p class="error"><b>Authentication Required: </b>The supplied credentials were unauthorized to access the specified content.</p>
+            <?php else: ?>
+            <p class="info"><b>Authentication Required: </b>Enter your username and password for &quot;<?php echo htmlspecialchars($data['realm']); ?>&quot; on <?php echo htmlspecialchars($GLOBALS['_url_parts']['host']); ?></p>
+            <?php endif; ?>
+        </div>
+    </form>
+<?php endif; ?>
+
+    <p class="footer"><a href="https://github.com/PHProxy/phproxy">PHProxy</a> <?= $GLOBALS['_version']; ?></p>
+</div>
+
+<script><?php echo phproxy_ui_js(); ?></script>
 </body>
 </html>
 
 <?php
+echo ob_get_clean();
 }
 
 function phproxy_render_panel_tabs(
@@ -3784,10 +3287,12 @@ function phproxy_render_panel_tabs(
     bool $show_cert = true,       // SSL tab — shown on entry + HTTPS proxied pages
     string $cert_host = '',       // Pre-fill the SSL form for the current page
     int $cert_port = 0,
-    bool $cert_autorun = false    // Auto-run the cert check when the SSL tab opens
+    bool $cert_autorun = false,   // Auto-run the cert check when the SSL tab opens
+    string $return_url = ''       // Current upstream URL, for fresh encoding after settings changes
 ): void {
     // Local aliases keep the existing template body unchanged
     $_panel_return_to      = $return_to;
+    $_panel_return_url     = $return_url;
     $_panel_show_response  = $show_response;
     $_panel_response_pairs = $response_pairs;
     $_panel_request_pairs  = $request_pairs;
@@ -3804,14 +3309,16 @@ function phproxy_render_panel_tabs(
     $_panel_network        = $network_entries;
     $_panel_net_current    = $network_current_url;
     $_panel_show_netchecks = $show_netchecks;
-    $_panel_show_cert      = $show_cert;
+    $_panel_show_cert      = $show_cert && getenv('PHPROXY_DIAGNOSTICS') === '1';
+    $_panel_diagnostics    = getenv('PHPROXY_DIAGNOSTICS') === '1';
     $_panel_cert_host      = $cert_host;
     $_panel_cert_port      = $cert_port > 0 ? $cert_port : 443;
     $_panel_cert_autorun   = $cert_autorun;
 
-$_panel_return_html = $_panel_return_to !== ''
-    ? '<input type="hidden" name="return_to" value="' . htmlspecialchars($_panel_return_to, ENT_QUOTES) . '"/>'
-    : '';
+$_panel_return_html = phproxy_csrf_field() . ($_panel_return_to !== ''
+    ? '<input type="hidden" name="return_to" value="' . htmlspecialchars($_panel_return_to, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"/>'
+      . '<input type="hidden" name="return_url" value="' . htmlspecialchars($_panel_return_url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"/>'
+    : '');
 $_form_attr = $_panel_form_id !== '' ? ' form="' . htmlspecialchars($_panel_form_id) . '"' : '';
 
 $_cfg          = $GLOBALS['_config'];
@@ -3820,8 +3327,9 @@ $_frozen       = $GLOBALS['_frozen_flags'];
 $_labels_local = $GLOBALS['_labels'];
 $_v_cookies    = $GLOBALS['_visible_cookies'] ?? [];
 $_c_headers    = $GLOBALS['_custom_headers']  ?? [];
+$_h_origins    = $GLOBALS['_header_origins'] ?? [];
 $_show_raw     = !empty($GLOBALS['_show_raw_values']);
-$_current_ua_local = isset($_COOKIE['userAgent']) ? $_COOKIE['userAgent'] : '';
+$_current_ua_local = phproxy_user_agent_setting();
 $_ua_presets_local = $GLOBALS['_ua_presets'] ?? [];
 ?>
 <div class="tabs-wrap">
@@ -3830,7 +3338,7 @@ $_ua_presets_local = $GLOBALS['_ua_presets'] ?? [];
     <input type="radio" name="tab" id="tab-headers"<?php echo $_panel_active_tab === 'headers' ? ' checked' : ''; ?>/>
     <?php if ($_panel_show_netchecks): ?>
     <input type="radio" name="tab" id="tab-ip"<?php echo $_panel_active_tab === 'ip' ? ' checked' : ''; ?>/>
-    <input type="radio" name="tab" id="tab-port"<?php echo $_panel_active_tab === 'port' ? ' checked' : ''; ?>/>
+    <?php if ($_panel_diagnostics): ?><input type="radio" name="tab" id="tab-port"<?php echo $_panel_active_tab === 'port' ? ' checked' : ''; ?>/><?php endif; ?>
     <input type="radio" name="tab" id="tab-dns"<?php echo $_panel_active_tab === 'dns' ? ' checked' : ''; ?>/>
     <?php endif; ?>
     <?php if ($_panel_show_cert): ?>
@@ -3850,7 +3358,7 @@ $_ua_presets_local = $GLOBALS['_ua_presets'] ?? [];
         <label for="tab-headers">Headers <span class="tab-count"><?php echo count($_c_headers); ?></span></label>
         <?php if ($_panel_show_netchecks): ?>
         <label for="tab-ip">IP</label>
-        <label for="tab-port">Port</label>
+        <?php if ($_panel_diagnostics): ?><label for="tab-port">Port</label><?php endif; ?>
         <label for="tab-dns">DNS</label>
         <?php endif; ?>
         <?php if ($_panel_show_cert): ?>
@@ -3884,7 +3392,7 @@ foreach ($_option_groups as $_group_name => $_group_flags):
             <ul class="prx-opt-menu">
 <?php foreach ($_group_flags as $_f): ?>
 <?php if (!$_frozen[$_f]): ?>
-                <li class="option"><label><input<?php echo $_form_attr; ?> type="checkbox" name="<?php echo $_cfg['flags_var_name']; ?>[<?php echo $_f; ?>]"<?php echo $_flags_local[$_f] ? ' checked' : ''; ?>/><span><?php echo $_labels_local[$_f][0]; ?></span></label></li>
+                <li class="option"><label><input<?php echo $_form_attr; ?> type="checkbox" name="<?php echo $_cfg['flags_var_name']; ?>[<?php echo $_f; ?>]"<?php echo $_flags_local[$_f] ? ' checked' : ''; ?>/><span><?php echo htmlspecialchars($_labels_local[$_f][0]); ?></span></label></li>
 <?php endif; ?>
 <?php endforeach; ?>
             </ul>
@@ -3897,7 +3405,7 @@ elseif ($_flags_local['rotate13'])          $_url_encoding = 'rot13';
 elseif ($_flags_local['base64_encode'])     $_url_encoding = 'base64';
 $_seed_ttl  = phproxy_seed_ttl();
 $_seed_bits = phproxy_seed_bits();
-$_seed_present = !empty($_COOKIE['phproxy-seed']);
+$_seed_present = phproxy_seed_present();
 ?>
         <fieldset class="option-group">
             <legend>Address bar</legend>
@@ -3909,7 +3417,7 @@ $_seed_present = !empty($_COOKIE['phproxy-seed']);
                 <label><input<?php echo $_form_attr; ?> type="radio" name="<?php echo $_cfg['flags_var_name']; ?>[__url_enc]" value="encrypted"<?php echo $_url_encoding === 'encrypted' ? ' checked' : ''; ?>/> Encrypted <span class="hint">(rotating key)</span></label>
             </div>
             <div class="seed-config">
-                <p class="tab-help">Encrypted mode wraps each URL with a fresh AES-CTR ciphertext keyed off a random session seed. Once the seed rotates, any URL recorded earlier (logs, history, referers) becomes useless.</p>
+                <p class="tab-help">Encrypted mode hides destination URLs in the address bar using a server-side session key. Rotation invalidates old links. It does not erase browsing history or the Network log.</p>
                 <div class="seed-row">
                     <form class="seed-mini" method="post" action="?action=set-seed-ttl">
                         <?php echo $_panel_return_html; ?>
@@ -3939,7 +3447,7 @@ $_seed_present = !empty($_COOKIE['phproxy-seed']);
 
     <section class="tab-panel" data-tab="cookies">
         <div class="tab-toolbar">
-            <p class="tab-help">Cookies held for proxied sites. Click a row to edit any attribute.</p>
+            <p class="tab-help">Cookies stored on this server for each exact upstream host. Click a row to edit.</p>
             <form class="toolbar-toggle" method="post" action="?action=toggle-raw">
                 <?php echo $_panel_return_html; ?>
                 <button type="submit" class="button-cancel" title="Switch between URL-decoded and raw wire-form values"><?php echo $_show_raw ? 'Showing: raw' : 'Showing: decoded'; ?></button>
@@ -3968,9 +3476,9 @@ foreach ($_v_cookies as $_wire => $_c):
                         <input type="hidden" name="name" value="<?php echo htmlspecialchars($_wire); ?>"/>
                         <label class="kv-edit-field"><span>Name</span><input type="text" name="cookieName" value="<?php echo htmlspecialchars($_c['display_name']); ?>" autocomplete="off"/></label>
                         <label class="kv-edit-field kv-edit-wide"><span>Value</span><input type="text" name="cookieValue" value="<?php echo htmlspecialchars($_c['value']); ?>" autocomplete="off"/></label>
-                        <label class="kv-edit-field"><span>Host</span><input type="text" name="cookieDomain" value="<?php echo $_c['is_proxy'] ? htmlspecialchars($_c['domain']) : ''; ?>" placeholder=".example.com" autocomplete="off"/></label>
+                        <label class="kv-edit-field"><span>Host</span><input type="text" name="cookieDomain" value="<?php echo htmlspecialchars(ltrim($_c['domain'], '.')); ?>" placeholder="example.com" autocomplete="off"/></label>
                         <label class="kv-edit-field"><span>Path</span><input type="text" name="cookiePath" value="<?php echo htmlspecialchars($_c['path'] ?: '/'); ?>" placeholder="/" autocomplete="off"/></label>
-                        <label class="kv-edit-field"><span>Expires <span class="hint">(days, 0 = session)</span></span><input type="number" name="cookieExpires" value="30" min="0" max="3650"/></label>
+                        <label class="kv-edit-field"><span>Expires <span class="hint">(days, 0 = session)</span></span><input type="number" name="cookieExpires" value="<?php echo empty($_c['expires']) ? 0 : max(1, (int) ceil(($_c['expires'] - time()) / 86400)); ?>" min="0" max="3650"/></label>
                         <label class="kv-edit-field"><span>SameSite</span>
                             <select name="cookieSameSite">
                                 <option value="">(default)</option>
@@ -3981,7 +3489,7 @@ foreach ($_v_cookies as $_wire => $_c):
                         </label>
                         <div class="kv-edit-checks">
                             <label class="kv-edit-check"><input type="checkbox" name="cookieSecure"<?php echo $_c['secure'] ? ' checked' : ''; ?>/> Secure</label>
-                            <label class="kv-edit-check"><input type="checkbox" name="cookieHttpOnly"/> HttpOnly</label>
+                            <label class="kv-edit-check"><input type="checkbox" name="cookieHttpOnly"<?php echo !empty($_c['httponly']) ? ' checked' : ''; ?>/> HttpOnly</label>
                         </div>
                         <div class="kv-edit-actions">
                             <button class="button-submit" type="submit">Save</button>
@@ -4003,7 +3511,7 @@ foreach ($_v_cookies as $_wire => $_c):
                 <?php echo $_panel_return_html; ?>
                 <label class="kv-edit-field"><span>Name</span><input type="text" name="cookieName" placeholder="session_id" autocomplete="off" required/></label>
                 <label class="kv-edit-field kv-edit-wide"><span>Value</span><input type="text" name="cookieValue" placeholder="abc123" autocomplete="off"/></label>
-                <label class="kv-edit-field"><span>Host <span class="hint">(empty = proxy domain)</span></span><input type="text" name="cookieDomain" placeholder=".example.com" autocomplete="off"/></label>
+                <label class="kv-edit-field"><span>Host <span class="hint">(exact match)</span></span><input type="text" name="cookieDomain" placeholder="example.com" autocomplete="off" required/></label>
                 <label class="kv-edit-field"><span>Path</span><input type="text" name="cookiePath" value="/" placeholder="/" autocomplete="off"/></label>
                 <label class="kv-edit-field"><span>Expires <span class="hint">(days, 0 = session)</span></span><input type="number" name="cookieExpires" value="30" min="0" max="3650"/></label>
                 <label class="kv-edit-field"><span>SameSite</span>
@@ -4058,14 +3566,14 @@ $_replay_skip = ['host' => 1, 'cookie' => 1, 'content-length' => 1, 'content-typ
 $_replay_pairs = [];
 foreach ($_panel_request_pairs as $_rh) {
     [$_rh_name, $_rh_value] = $_rh;
-    if ($_rh_name === '' || $_rh_name[0] === ':') continue;
+    if ($_rh_name === '' || $_rh_name[0] === ':' || $_rh_value === '[redacted]') continue;
     if (isset($_replay_skip[strtolower($_rh_name)])) continue;
     $_replay_pairs[] = [$_rh_name, $_rh_value];
 }
 ?>
 <?php if (!empty($_replay_pairs)): ?>
         <p class="section-label">Request headers</p>
-        <p class="tab-help">Headers PHProxy sent on this request. Edit any value to override it for future requests to this host; clicking <strong>Save &amp; replay</strong> stores the override and reloads the page.</p>
+        <p class="tab-help">Headers from the latest request. Sensitive values are redacted. Save an override to use it on future requests to this site.</p>
         <ul class="kv-list">
 <?php foreach ($_replay_pairs as $_rh): list($_rh_name, $_rh_value) = $_rh;
     $_is_overridden = isset($_c_headers[$_rh_name]);
@@ -4081,10 +3589,11 @@ foreach ($_panel_request_pairs as $_rh) {
                     </summary>
                     <form class="kv-edit" method="post" action="?action=add-header">
                         <?php echo $_panel_return_html; ?>
+                        <input type="hidden" name="headerOrigin" value="<?php echo htmlspecialchars($_panel_cli_url); ?>"/>
                         <input type="hidden" name="headerAddName" value="<?php echo htmlspecialchars($_rh_name); ?>"/>
                         <label class="kv-edit-field kv-edit-wide"><span>Value</span><input type="text" name="headerAddValue" value="<?php echo htmlspecialchars($_rh_value); ?>" autocomplete="off"/></label>
                         <div class="kv-edit-actions">
-                            <button class="button-submit" type="submit">Save &amp; replay</button>
+                            <button class="button-submit" type="submit">Save override</button>
                         </div>
                     </form>
                 </details>
@@ -4103,7 +3612,7 @@ foreach ($_panel_request_pairs as $_rh) {
 <?php endif; ?>
 
         <p class="section-label">Custom headers</p>
-        <p class="tab-help">Extra HTTP headers sent on every outbound request. Header names: ASCII letters, digits, hyphens.</p>
+        <p class="tab-help">Extra HTTP headers sent only to the specified site origin (scheme, host and port). Header names: ASCII letters, digits, hyphens.</p>
 <?php if (empty($_c_headers)): ?>
         <ul class="kv-list"><li class="empty">No custom headers</li></ul>
 <?php else: ?>
@@ -4121,6 +3630,7 @@ foreach ($_panel_request_pairs as $_rh) {
                         <?php echo $_panel_return_html; ?>
                         <input type="hidden" name="oldName" value="<?php echo htmlspecialchars($_h_name); ?>"/>
                         <label class="kv-edit-field"><span>Name</span><input type="text" name="headerName" value="<?php echo htmlspecialchars($_h_name); ?>" pattern="[A-Za-z0-9-]+" autocomplete="off"/></label>
+                        <label class="kv-edit-field"><span>Site URL</span><input type="url" name="headerOrigin" value="<?php echo htmlspecialchars($_h_origins[$_h_name] ?? ''); ?>" placeholder="https://example.com" required/></label>
                         <label class="kv-edit-field"><span>Value</span><input type="text" name="headerValue" value="<?php echo htmlspecialchars($_h_value); ?>" autocomplete="off"/></label>
                         <div class="kv-edit-actions">
                             <button class="button-submit" type="submit">Save</button>
@@ -4139,6 +3649,7 @@ foreach ($_panel_request_pairs as $_rh) {
         <p class="section-label">Add a header</p>
         <form class="kv-add" method="post" action="?action=add-header">
             <?php echo $_panel_return_html; ?>
+            <input type="url" name="headerOrigin" placeholder="https://example.com" required/>
             <input type="text" name="headerAddName" placeholder="Accept-Language" pattern="[A-Za-z0-9-]+" autocomplete="off"/>
             <input type="text" name="headerAddValue" placeholder="en-GB,en;q=0.9" autocomplete="off"/>
             <button type="submit">Add</button>
@@ -4147,7 +3658,7 @@ foreach ($_panel_request_pairs as $_rh) {
 
     <?php if ($_panel_show_netchecks): ?>
     <section class="tab-panel" data-tab="ip">
-        <p class="tab-help">Network identity for the current request. <strong>Client</strong> is who you appear as to this server; <strong>Outgoing</strong> is what the wider internet sees when the server reaches out. All data is collected locally via PHP built-ins — no external lookups, no API keys.</p>
+        <p class="tab-help">Network identity for the current request. <strong>Client</strong> is who you appear as to this server; <strong>Outgoing</strong> is the local network interface used for outbound traffic; its public address may differ behind NAT. All data is collected locally via PHP built-ins — no external lookups, no API keys.</p>
         <div class="ipinfo-wrap" data-ipinfo-target>
             <div class="ipinfo-loading">Looking up IPs…</div>
         </div>
@@ -4162,18 +3673,20 @@ foreach ($_panel_request_pairs as $_rh) {
         </form>
     </section>
 
+    <?php if ($_panel_diagnostics): ?>
     <section class="tab-panel" data-tab="port">
-        <p class="tab-help">Test TCP reachability and measure connection latency. A single port (<code>443</code>), an inclusive range (<code>80-443</code>) or a comma list (<code>22,80,443,8000-8010</code>) — up to 128 ports per scan. Loopback / RFC1918 hosts are blocked.</p>
+        <p class="tab-help">Test TCP reachability and measure connection latency. A single port (<code>443</code>), an inclusive range (<code>8000-8010</code>) or a comma list (<code>22,80,443,8000-8010</code>) — up to 128 ports per scan. Only public destinations are allowed; checks stop after 10 seconds.</p>
         <form class="netcheck netcheck-solo" data-netcheck="portcheck" autocomplete="off">
             <div class="netcheck-fields">
                 <input type="text" name="host" placeholder="host.example.com" required spellcheck="false" autocapitalize="off"/>
-                <input type="text" name="port" placeholder="443  or  80-443  or  22,80,443" pattern="[0-9,\-\s]+" required spellcheck="false" autocapitalize="off"/>
+                <input type="text" name="port" placeholder="443  or  8000-8010  or  22,80,443" pattern="[0-9,\-\s]+" required spellcheck="false" autocapitalize="off"/>
             </div>
             <button class="button-submit" type="submit">Check port</button>
             <pre class="netcheck-result" hidden></pre>
         </form>
     </section>
 
+    <?php endif; ?>
     <section class="tab-panel" data-tab="dns">
         <p class="tab-help">Resolve DNS records via the server's resolver. A / AAAA / MX / TXT / NS / SOA / CAA / CNAME / SRV / ANY supported.</p>
         <form class="netcheck netcheck-solo" data-netcheck="dns" autocomplete="off">
@@ -4264,18 +3777,17 @@ foreach ($_panel_request_pairs as $_rh) {
 
     <?php
         $_cli_has_url = $_panel_cli_url !== '';
-        // Base URL for the check examples — the proxy's own URL, without
-        // the ?api=fetch suffix. Falls back to $_script_url for the entry page.
-        $_cli_base = $_panel_cli_api_url !== ''
-            ? (string) preg_replace('/\?.*$/', '', $_panel_cli_api_url)
-            : (string) ($GLOBALS['_script_url'] ?? '');
+        // The proxy endpoint always comes from this deployment's public URL;
+        // the selected upstream destination belongs only in the request payload.
+        $_cli_endpoints = phproxy_cli_endpoints($_SERVER);
+        $_cli_base = $_cli_endpoints['base'];
         // When there's no URL context (entry page) we still want to show how
         // to drive ?api=fetch — fall back to a clear placeholder URL.
         $_cli_url_eff     = $_cli_has_url ? $_panel_cli_url     : 'https://example.com/';
         $_cli_method_eff  = $_panel_cli_method !== '' ? $_panel_cli_method : 'GET';
-        $_cli_headers_eff = $_cli_has_url ? $_panel_cli_headers : [['User-Agent', 'PHProxy/1.0']];
+        $_cli_headers_eff = $_cli_has_url ? $_panel_cli_headers : [['User-Agent', 'PHProxy/1.4.0']];
         $_cli_body_eff    = $_panel_cli_body;
-        $_cli_api_url_eff = $_panel_cli_api_url !== '' ? $_panel_cli_api_url : ($_cli_base . '?api=fetch');
+        $_cli_api_url_eff = $_cli_endpoints['fetch'];
         $_cli_snippets = [
             'curl'   => [
                 'label'  => 'curl',
@@ -4311,13 +3823,8 @@ foreach ($_panel_request_pairs as $_rh) {
         $_cli_first = true;
     ?>
     <section class="tab-panel" data-tab="cli">
-        <p class="tab-help">
-            <?php if ($_cli_has_url): ?>
-            Reproduce this request from the command line. <strong>Direct</strong> hits the upstream target without involving PHProxy; <strong>Via PHProxy</strong> POSTs to the JSON API. <strong>Port / DNS / SSL</strong> below show how to drive the network-check endpoints from each language.
-            <?php else: ?>
-            How to drive every endpoint from the command line. <strong>Direct</strong> and <strong>Via PHProxy</strong> use a placeholder URL — open a proxied page and these snippets get pre-filled with that specific URL, method, headers and body. <strong>Port / DNS / SSL</strong> below drive the network-check endpoints.
-            <?php endif; ?>
-        </p>
+        <p class="tab-help">Use <strong>Via PHProxy</strong> to make the request from this proxy server. The destination URL appears in the JSON payload. <strong>Direct to destination</strong> sends the request from your own computer.</p>
+        <p class="tab-help">Proxy endpoint: <code><?php echo htmlspecialchars($_cli_api_url_eff, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></code><br/>Destination<?php echo $_cli_has_url ? '' : ' (example)'; ?>: <code><?php echo htmlspecialchars($_cli_url_eff, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></code></p>
         <div class="cli-wrap">
 <?php foreach ($_cli_snippets as $_cli_key => $_cli_meta): ?>
             <input type="radio" name="cli-tab" id="cli-tab-<?php echo $_cli_key; ?>"<?php echo $_cli_first ? ' checked' : ''; $_cli_first = false; ?>/>
@@ -4331,17 +3838,17 @@ foreach ($_panel_request_pairs as $_rh) {
             <section class="cli-panel" data-cli="<?php echo $_cli_key; ?>">
                 <div class="cli-variant">
                     <div class="cli-toolbar">
-                        <span class="cli-variant-label">Direct to upstream<?php echo $_cli_has_url ? '' : ' (example)'; ?></span>
-                        <button type="button" class="button-cancel cli-copy" data-target="cli-snippet-<?php echo $_cli_key; ?>-direct">Copy</button>
+                        <span class="cli-variant-label">Via PHProxy server<?php echo $_cli_has_url ? '' : ' (example)'; ?></span>
+                        <button type="button" class="button-cancel cli-copy" data-target="cli-snippet-<?php echo $_cli_key; ?>-proxy">Copy proxy command</button>
                     </div>
-                    <pre id="cli-snippet-<?php echo $_cli_key; ?>-direct" class="cli-snippet"><?php echo htmlspecialchars($_cli_meta['direct']); ?></pre>
+                    <pre id="cli-snippet-<?php echo $_cli_key; ?>-proxy" class="cli-snippet"><?php echo htmlspecialchars($_cli_meta['proxy']); ?></pre>
                 </div>
                 <div class="cli-variant">
                     <div class="cli-toolbar">
-                        <span class="cli-variant-label">Via PHProxy <code>?api=fetch</code><?php echo $_cli_has_url ? '' : ' (example)'; ?></span>
-                        <button type="button" class="button-cancel cli-copy" data-target="cli-snippet-<?php echo $_cli_key; ?>-proxy">Copy</button>
+                        <span class="cli-variant-label">Direct to destination<?php echo $_cli_has_url ? '' : ' (example)'; ?></span>
+                        <button type="button" class="button-cancel cli-copy" data-target="cli-snippet-<?php echo $_cli_key; ?>-direct">Copy direct command</button>
                     </div>
-                    <pre id="cli-snippet-<?php echo $_cli_key; ?>-proxy" class="cli-snippet"><?php echo htmlspecialchars($_cli_meta['proxy']); ?></pre>
+                    <pre id="cli-snippet-<?php echo $_cli_key; ?>-direct" class="cli-snippet"><?php echo htmlspecialchars($_cli_meta['direct']); ?></pre>
                 </div>
                 <div class="cli-variant">
                     <div class="cli-toolbar">
@@ -4419,16 +3926,18 @@ foreach ($_net_rev as $_ne):
  */
 function phproxy_net_log(string $url, string $method, int $status, string $type, int $size, float $start, ?float $ttfb_t, float $end): void
 {
-    if (!isset($_SESSION) || !is_array($_SESSION)) return;
+    // Re-read while holding the lock; parallel downloads cannot overwrite
+    // entries appended after their original request snapshot was taken.
+    phproxy_state_open();
     if (!isset($_SESSION['phproxy_network']) || !is_array($_SESSION['phproxy_network'])) $_SESSION['phproxy_network'] = [];
     $ttfb_ms     = $ttfb_t !== null ? (int) (($ttfb_t - $start) * 1000) : 0;
     $duration_ms = (int) (($end - $start) * 1000);
     $_SESSION['phproxy_network'][] = [
         'ts'          => $start,
-        'url'         => $url,
-        'method'      => $method,
+        'url'         => substr($url, 0, 2048),
+        'method'      => substr($method, 0, 16),
         'status'      => $status,
-        'type'        => $type !== '' ? $type : 'unknown',
+        'type'        => $type !== '' ? substr($type, 0, 128) : 'unknown',
         'size'        => $size,
         'ttfb_ms'     => $ttfb_ms,
         'duration_ms' => $duration_ms,
@@ -4436,6 +3945,7 @@ function phproxy_net_log(string $url, string $method, int $status, string $type,
     if (count($_SESSION['phproxy_network']) > 50) {
         $_SESSION['phproxy_network'] = array_slice($_SESSION['phproxy_network'], -50);
     }
+    phproxy_state_close();
 }
 
 /**
@@ -4458,6 +3968,13 @@ function phproxy_fmt_size(int $bytes): string
  * returns a single-string snippet. Quoting / escaping is per-language so
  * values containing apostrophes or backslashes survive the round-trip.
  */
+
+/** Resolve CLI transport endpoints independently of the selected destination. */
+function phproxy_cli_endpoints(array $server, ?string $configured = null): array
+{
+    $base = phproxy_public_script_url($server, $configured);
+    return ['base' => $base, 'fetch' => $base . '?api=fetch'];
+}
 
 function phproxy_snip_shell(string $v): string {
     // POSIX-shell single-quoted: close, escaped quote, reopen — 'don'\''t' style
@@ -4825,7 +4342,7 @@ function phproxy_cli_go_proxy(string $api_url, string $upstream, string $method,
 function phproxy_cli_checks_curl(string $base): string
 {
     $u_port_one   = $base . '?api=portcheck&host=example.com&port=443';
-    $u_port_range = $base . '?api=portcheck&host=example.com&port=80-443';
+    $u_port_range = $base . '?api=portcheck&host=example.com&port=8000-8010';
     $u_port_list  = $base . '?api=portcheck&host=example.com&port=22,80,443,8000-8010';
     $u_dns        = $base . '?api=dns&host=example.com&type=A';
     $u_cert       = $base . '?api=cert&host=example.com&port=443';
@@ -4858,8 +4375,8 @@ function phproxy_cli_checks_php(string $base): string
     $out .= "\$ipinfo = json_decode(file_get_contents(\$base . '?api=ipinfo'), true);\n";
     $out .= "printf(\"client:   %s   %s\\n\",   \$ipinfo['client']['ip'],   \$ipinfo['client']['reverse']   ?? '');\n";
     $out .= "printf(\"outgoing: %s   %s\\n\", \$ipinfo['outgoing']['ip'], \$ipinfo['outgoing']['reverse'] ?? '');\n\n";
-    $out .= "// Port check — accepts: 443  |  80-443  |  22,80,443,8000-8010  (max 128)\n";
-    $out .= "\$port = json_decode(file_get_contents(\$base . '?api=portcheck&host=example.com&port=80-443'), true);\n";
+    $out .= "// Port check — accepts: 443  |  8000-8010  |  22,80,443,8000-8010  (max 128)\n";
+    $out .= "\$port = json_decode(file_get_contents(\$base . '?api=portcheck&host=example.com&port=8000-8010'), true);\n";
     $out .= "foreach (\$port['results'] as \$r) {\n";
     $out .= "    printf(\"%5d  %s  %d ms\\n\", \$r['port'], \$r['reachable'] ? 'OPEN  ' : 'CLOSED', \$r['latency_ms']);\n";
     $out .= "}\n\n";
@@ -4880,8 +4397,8 @@ function phproxy_cli_checks_python(string $base): string
     $out .= "ip = requests.get(base, params={'api': 'ipinfo'}).json()\n";
     $out .= "print(f\"client:   {ip['client']['ip']}   {ip['client'].get('reverse','')}\")\n";
     $out .= "print(f\"outgoing: {ip['outgoing']['ip']}   {ip['outgoing'].get('reverse','')}\")\n\n";
-    $out .= "# Port check — accepts: 443  |  80-443  |  22,80,443,8000-8010  (max 128)\n";
-    $out .= "scan = requests.get(base, params={'api': 'portcheck', 'host': 'example.com', 'port': '80-443'}).json()\n";
+    $out .= "# Port check — accepts: 443  |  8000-8010  |  22,80,443,8000-8010  (max 128)\n";
+    $out .= "scan = requests.get(base, params={'api': 'portcheck', 'host': 'example.com', 'port': '8000-8010'}).json()\n";
     $out .= "for r in scan['results']:\n";
     $out .= "    print(f\"{r['port']:>5}  {'OPEN  ' if r['reachable'] else 'CLOSED'}  {r['latency_ms']} ms\")\n\n";
     $out .= "# DNS lookup\n";
@@ -4899,8 +4416,8 @@ function phproxy_cli_checks_js(string $base): string
          . "const ip = await fetch(base + '?api=ipinfo').then(r => r.json());\n"
          . "console.log(`client:   \${ip.client.ip}   \${ip.client.reverse ?? ''}`);\n"
          . "console.log(`outgoing: \${ip.outgoing.ip}   \${ip.outgoing.reverse ?? ''}`);\n\n"
-         . "// Port check — accepts: 443  |  80-443  |  22,80,443,8000-8010  (max 128)\n"
-         . "const scan = await fetch(base + '?api=portcheck&host=example.com&port=80-443').then(r => r.json());\n"
+         . "// Port check — accepts: 443  |  8000-8010  |  22,80,443,8000-8010  (max 128)\n"
+         . "const scan = await fetch(base + '?api=portcheck&host=example.com&port=8000-8010').then(r => r.json());\n"
          . "for (const r of scan.results) {\n"
          . "    console.log(`\${String(r.port).padStart(5)}  \${r.reachable ? 'OPEN  ' : 'CLOSED'}  \${r.latency_ms} ms`);\n"
          . "}\n\n"
@@ -4934,8 +4451,8 @@ function phproxy_cli_checks_go(string $base): string
     $out .= '    base := ' . $b . "\n\n";
     $out .= "    // IP info — me, the server, the server's outgoing IP + reverse DNS\n";
     $out .= "    fmt.Println(get(base + \"?api=ipinfo\"))\n\n";
-    $out .= "    // Port check — accepts: 443  |  80-443  |  22,80,443,8000-8010  (max 128)\n";
-    $out .= "    scan := get(base + \"?api=portcheck&host=example.com&port=80-443\")\n";
+    $out .= "    // Port check — accepts: 443  |  8000-8010  |  22,80,443,8000-8010  (max 128)\n";
+    $out .= "    scan := get(base + \"?api=portcheck&host=example.com&port=8000-8010\")\n";
     $out .= "    for _, r := range scan[\"results\"].([]any) {\n";
     $out .= "        rr := r.(map[string]any)\n";
     $out .= "        status := \"CLOSED\"\n";
@@ -4955,242 +4472,99 @@ function phproxy_cli_checks_go(string $base): string
  */
 function phproxy_api_fetch(array $req): array
 {
-    $url           = (string) ($req['url'] ?? '');
-    $method        = strtoupper((string) ($req['method'] ?? 'GET'));
-    $headers_in    = is_array($req['headers'] ?? null) ? $req['headers'] : [];
-    $cookies_in    = is_array($req['cookies'] ?? null) ? $req['cookies'] : [];
-    $body          = (string) ($req['body'] ?? '');
-    $timeout       = max(1, min(120, (int) ($req['timeout'] ?? 30)));
-    $follow        = !empty($req['follow_redirects']);
-    $max_redirects = max(0, min(10, (int) ($req['max_redirects'] ?? 5)));
-    $verify_ssl    = !isset($req['verify_ssl']) || $req['verify_ssl'] !== false;
-
-    $started   = microtime(true);
+    $started = microtime(true);
+    $url = is_string($req['url'] ?? null) ? $req['url'] : '';
+    $deadline = $started + max(1, min(30, (int) ($req['timeout'] ?? 30)));
+    $limit = max(1, min(16 * 1024 * 1024, (int) ($req['max_response_bytes'] ?? 8 * 1024 * 1024)));
     $redirects = [];
-
-    while (true) {
-        $parts = @parse_url($url);
-        if (empty($parts['scheme']) || empty($parts['host'])) {
-            return ['ok' => false, 'error' => 'Invalid URL', 'url' => $url];
+    $sock = null;
+    try {
+        if (isset($req['method']) && !is_string($req['method'])) throw new InvalidArgumentException('Method must be a string');
+        if (($req['verify_ssl'] ?? true) !== true) throw new InvalidArgumentException('TLS certificate verification cannot be disabled');
+        $method = strtoupper($req['method'] ?? 'GET');
+        if (!in_array($method, ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], true)) {
+            throw new InvalidArgumentException('Unsupported HTTP method');
         }
-        $scheme = strtolower($parts['scheme']);
-        if (!in_array($scheme, ['http', 'https'], true)) {
-            return ['ok' => false, 'error' => 'Only http/https schemes are allowed', 'url' => $url];
-        }
-        $host = $parts['host'];
-        $port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
-        $path = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
-
-        // Open socket
-        $proto = $scheme === 'https' ? 'ssl' : 'tcp';
-        $ctx_opts = [];
-        if ($scheme === 'https' && !$verify_ssl) {
-            $ctx_opts['ssl'] = ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true];
-        }
-        $ctx  = stream_context_create($ctx_opts);
-        $sock = @stream_socket_client("$proto://$host:$port", $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $ctx);
-        if ($sock === false) {
-            return ['ok' => false, 'error' => $errstr !== '' ? $errstr : 'Connection failed', 'errno' => (int) $errno, 'url' => $url];
-        }
-        stream_set_timeout($sock, $timeout);
-
-        // Build request line + headers, sanitising every name/value to prevent
-        // CRLF injection. Caller-supplied Host / Connection / Content-Length
-        // are ignored — we set those ourselves.
-        $req_lines = [];
-        $default_port = $scheme === 'https' ? 443 : 80;
-        $req_lines[] = "$method $path HTTP/1.0";
-        $req_lines[] = "Host: $host" . ($port != $default_port ? ":$port" : '');
-        $req_lines[] = 'Connection: close';
-
-        $seen_lower = ['host' => 1, 'connection' => 1, 'content-length' => 1];
-        $headers_lower = array_change_key_case($headers_in, CASE_LOWER);
-        foreach ($headers_in as $hname => $hvalue) {
-            if (!is_string($hname) || !preg_match('/^[A-Za-z0-9-]+$/', $hname)) continue;
-            $hlower = strtolower($hname);
-            if (isset($seen_lower[$hlower])) continue;
-            $hvalue = (string) $hvalue;
-            if (strpbrk($hvalue, "\r\n") !== false) continue;
-            $req_lines[]            = "$hname: $hvalue";
-            $seen_lower[$hlower]    = 1;
-        }
-        if (!isset($headers_lower['user-agent'])) {
-            $req_lines[] = 'User-Agent: PHProxy-API/1.2.0';
-        }
-        if (!isset($headers_lower['accept'])) {
-            $req_lines[] = 'Accept: */*';
-        }
-
-        // Cookies
-        if (!empty($cookies_in)) {
-            $cookie_parts = [];
-            foreach ($cookies_in as $cname => $cvalue) {
-                if (!is_string($cname) || strpbrk($cname, ";,= \t\r\n") !== false) continue;
-                $cvalue = (string) $cvalue;
-                if (strpbrk($cvalue, ";\r\n") !== false) continue;
-                $cookie_parts[] = "$cname=$cvalue";
+        $headers = phproxy_prepare_request_headers($req['headers'] ?? []);
+        $cookies = $req['cookies'] ?? [];
+        if (!is_array($cookies)) throw new InvalidArgumentException('Cookies must be an object');
+        $cookie_parts = [];
+        foreach ($cookies as $name => $value) {
+            if (!is_string($name) || !preg_match('/^[!#$%&\'*+.^_`|~0-9A-Za-z-]+$/D', $name) || !is_scalar($value)) {
+                throw new InvalidArgumentException('Invalid cookie');
             }
-            if ($cookie_parts) {
-                $req_lines[] = 'Cookie: ' . implode('; ', $cookie_parts);
+            $value = (string) $value;
+            if (preg_match('/[\x00-\x20\x7f;,]/', $value)) throw new InvalidArgumentException('Invalid cookie value');
+            $cookie_parts[] = $name . '=' . $value;
+        }
+        if ($cookie_parts) {
+            if (isset($headers['cookie'])) throw new InvalidArgumentException('Specify cookies in only one field');
+            $headers['cookie'] = implode('; ', $cookie_parts);
+        }
+        $body = $req['body'] ?? '';
+        if (!is_string($body) || strlen($body) > 2 * 1024 * 1024) throw new InvalidArgumentException('Request body exceeds 2 MiB or is not a string');
+        if ($body !== '' && in_array($method, ['GET', 'HEAD'], true)) throw new InvalidArgumentException('This method does not accept a body');
+        $follow = !empty($req['follow_redirects']);
+        $max_redirects = max(0, min(5, (int) ($req['max_redirects'] ?? 5)));
+        while (true) {
+            $target = phproxy_parse_http_url($url);
+            $sock = phproxy_open_public_socket($target['host'], $target['port'], $target['scheme'] === 'https', $deadline);
+            $request_headers = $headers;
+            $request_headers['host'] = $target['authority'];
+            $request_headers['connection'] = 'close';
+            $request_headers['accept'] ??= '*/*';
+            $request_headers['user-agent'] ??= 'PHProxy/1.4.0';
+            $request_headers['accept-encoding'] ??= 'gzip, deflate';
+            if ($body !== '' || in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+                $request_headers['content-length'] = (string) strlen($body);
+                $request_headers['content-type'] ??= 'application/octet-stream';
             }
-        }
-
-        // Body
-        if ($body !== '' && in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
-            $req_lines[] = 'Content-Length: ' . strlen($body);
-            if (!isset($headers_lower['content-type'])) {
-                $req_lines[] = 'Content-Type: application/octet-stream';
+            $wire = $method . ' ' . $target['path'] . " HTTP/1.1\r\n";
+            foreach ($request_headers as $name => $value) {
+                if ($name === 'user-agent' && $value === '') continue;
+                $wire .= $name . ': ' . $value . "\r\n";
             }
-        }
-
-        $request = implode("\r\n", $req_lines) . "\r\n\r\n" . $body;
-        fwrite($sock, $request);
-
-        // Read response — headers first (until \r\n\r\n), then body
-        $head_raw = '';
-        while (!feof($sock)) {
-            $chunk = fread($sock, 8192);
-            if ($chunk === false || $chunk === '') break;
-            $head_raw .= $chunk;
-            if (($sep = strpos($head_raw, "\r\n\r\n")) !== false) break;
-        }
-        $info = stream_get_meta_data($sock);
-        if (!empty($info['timed_out'])) {
+            if (strlen($wire) > 32768) throw new InvalidArgumentException('Request headers exceed 32 KiB');
+            phproxy_stream_write_all($sock, $wire . "\r\n" . $body, $deadline);
+            $response = phproxy_read_http_response($sock, $method, $deadline, $limit);
             fclose($sock);
-            return ['ok' => false, 'error' => 'Connection timed out', 'url' => $url];
-        }
-        $sep      = strpos($head_raw, "\r\n\r\n");
-        if ($sep === false) {
-            fclose($sock);
-            return ['ok' => false, 'error' => 'Malformed response (no header terminator)', 'url' => $url];
-        }
-        $head     = substr($head_raw, 0, $sep);
-        $body_raw = substr($head_raw, $sep + 4);
-        while (!feof($sock)) {
-            $chunk = fread($sock, 8192);
-            if ($chunk === false || $chunk === '') break;
-            $body_raw .= $chunk;
-        }
-        fclose($sock);
-
-        // Parse status + headers
-        $lines = explode("\r\n", $head);
-        $status_line = array_shift($lines);
-        if (!preg_match('#^HTTP/(?:\d\.\d|\d) (\d+)(?: (.*))?$#', $status_line, $sm)) {
-            return ['ok' => false, 'error' => 'Invalid status line: ' . $status_line, 'url' => $url];
-        }
-        $status      = (int) $sm[1];
-        $status_text = $sm[2] ?? '';
-
-        $resp_headers = [];
-        $set_cookies  = [];
-        foreach ($lines as $line) {
-            $colon = strpos($line, ':');
-            if ($colon === false) continue;
-            $hn = trim(substr($line, 0, $colon));
-            $hv = trim(substr($line, $colon + 1));
-            if (strcasecmp($hn, 'set-cookie') === 0) {
-                $cparts = preg_split('/;\s*/', $hv);
-                $first  = (string) array_shift($cparts);
-                $eq     = strpos($first, '=');
-                $cn     = $eq === false ? $first : substr($first, 0, $eq);
-                $cv     = $eq === false ? ''     : substr($first, $eq + 1);
-                $ck     = ['name' => $cn, 'value' => $cv, 'domain' => '', 'path' => '', 'expires' => '', 'max_age' => null, 'secure' => false, 'httponly' => false, 'samesite' => ''];
-                foreach ($cparts as $cp) {
-                    if (strcasecmp($cp, 'Secure') === 0)   { $ck['secure']   = true; continue; }
-                    if (strcasecmp($cp, 'HttpOnly') === 0) { $ck['httponly'] = true; continue; }
-                    $eq2 = strpos($cp, '=');
-                    if ($eq2 === false) continue;
-                    $k = strtolower(trim(substr($cp, 0, $eq2)));
-                    $v = trim(substr($cp, $eq2 + 1));
-                    if ($k === 'domain')   $ck['domain']   = $v;
-                    if ($k === 'path')     $ck['path']     = $v;
-                    if ($k === 'expires')  $ck['expires']  = $v;
-                    if ($k === 'samesite') $ck['samesite'] = $v;
-                    if ($k === 'max-age')  $ck['max_age']  = (int) $v;
-                }
-                $set_cookies[] = $ck;
+            $sock = null;
+            $status = $response['status'];
+            if ($follow && in_array($status, [301, 302, 303, 307, 308], true) && isset($response['headers']['location'])) {
+                if (count($redirects) >= $max_redirects) throw new RuntimeException('Too many redirects');
+                $next_url = phproxy_resolve_http_location($url, $response['headers']['location']);
+                $next = phproxy_parse_http_url($next_url);
+                [$method, $headers, $body] = phproxy_redirect_request($target, $next, $status, $method, $headers, $body);
+                $redirects[] = ['from' => $url, 'status' => $status, 'to' => $next_url];
+                $url = $next_url;
                 continue;
             }
-            if (isset($resp_headers[$hn])) {
-                $resp_headers[$hn] .= ', ' . $hv;
-            } else {
-                $resp_headers[$hn] = $hv;
-            }
+            $response['ok'] = true;
+            $response['url'] = $url;
+            $response['redirects'] = $redirects;
+            $response['duration_ms'] = (int) ((microtime(true) - $started) * 1000);
+            return $response;
         }
-
-        // Redirects
-        $resp_headers_lower = array_change_key_case($resp_headers, CASE_LOWER);
-        if ($follow && in_array($status, [301, 302, 303, 307, 308], true) && !empty($resp_headers_lower['location'])) {
-            if (count($redirects) >= $max_redirects) {
-                return ['ok' => false, 'error' => 'Too many redirects', 'url' => $url, 'redirects' => $redirects];
-            }
-            $redirects[] = ['from' => $url, 'status' => $status, 'to' => $resp_headers_lower['location']];
-            $loc = $resp_headers_lower['location'];
-            if (preg_match('#^[a-z]+://#i', $loc)) {
-                $url = $loc;
-            } elseif ($loc !== '' && $loc[0] === '/') {
-                $url = "$scheme://$host" . ($port != $default_port ? ":$port" : '') . $loc;
-            } else {
-                $dir = preg_replace('#/[^/]*$#', '/', ($parts['path'] ?? '/'));
-                $url = "$scheme://$host" . ($port != $default_port ? ":$port" : '') . $dir . $loc;
-            }
-            if ($status === 303 || (in_array($status, [301, 302], true) && in_array($method, ['POST', 'PUT', 'PATCH'], true))) {
-                $method = 'GET';
-                $body   = '';
-            }
-            continue;
-        }
-
-        // Decode chunked / gzip / deflate so the JSON body is the actual payload
-        if (!empty($resp_headers_lower['transfer-encoding']) && stripos($resp_headers_lower['transfer-encoding'], 'chunked') !== false) {
-            $body_raw = phproxy_api_decode_chunked($body_raw);
-        }
-        if (!empty($resp_headers_lower['content-encoding'])) {
-            $enc = strtolower($resp_headers_lower['content-encoding']);
-            if ($enc === 'gzip' && function_exists('gzdecode')) {
-                $d = @gzdecode($body_raw);
-                if ($d !== false) $body_raw = $d;
-            } elseif ($enc === 'deflate' && function_exists('gzinflate')) {
-                $d = @gzinflate($body_raw);
-                if ($d !== false) $body_raw = $d;
-            }
-        }
-
-        return [
-            'ok'                   => true,
-            'url'                  => $url,
-            'status'               => $status,
-            'status_text'          => $status_text,
-            'headers'              => $resp_headers,
-            'set_cookies'          => $set_cookies,
-            'body_raw'             => $body_raw,
-            'redirects'            => $redirects,
-            'duration_ms'          => (int) ((microtime(true) - $started) * 1000),
-        ];
+    } catch (Throwable $e) {
+        if (is_resource($sock)) fclose($sock);
+        $invalid = $e instanceof InvalidArgumentException;
+        $timeout = $e->getCode() === 408;
+        return ['ok' => false, 'error' => $e->getMessage(), 'error_code' => $invalid ? 'invalid_request' : ($timeout ? 'timeout' : 'upstream_error'),
+            'http_status' => $invalid ? 400 : ($timeout ? 504 : 502), 'url' => $url, 'redirects' => $redirects];
     }
 }
 
-/**
- * Decode an HTTP/1.1 chunked transfer-encoded body.
- */
+/** Decode a complete chunked body, rejecting incomplete framing. */
 function phproxy_api_decode_chunked(string $body): string
 {
-    $out = '';
-    $pos = 0;
-    $len = strlen($body);
-    while ($pos < $len) {
-        $eol = strpos($body, "\r\n", $pos);
-        if ($eol === false) break;
-        $size_line = substr($body, $pos, $eol - $pos);
-        $size_hex  = strpos($size_line, ';') !== false ? substr($size_line, 0, strpos($size_line, ';')) : $size_line;
-        $size      = (int) hexdec(trim($size_hex));
-        if ($size <= 0) break;
-        $pos        = $eol + 2;
-        $out       .= substr($body, $pos, $size);
-        $pos       += $size + 2;  // chunk + trailing CRLF
+    $stream = fopen('php://temp', 'w+b');
+    fwrite($stream, $body);
+    rewind($stream);
+    try {
+        return phproxy_read_chunked_body($stream, microtime(true) + 5, 8 * 1024 * 1024);
+    } finally {
+        fclose($stream);
     }
-    return $out;
 }
 
 /**
@@ -7544,4 +6918,499 @@ function phproxy_panel_css(): string {
     #phproxy-panel .kv-edit-wide   { grid-column: span 1; }
 }
 PHPROXY_PANEL_CSS;
+}
+
+// Shared bounded transport. All outbound HTTP and diagnostic sockets use this policy.
+function phproxy_ip_in_cidr(string $ip, string $cidr): bool
+{
+    [$network, $prefix] = explode('/', $cidr, 2);
+    $address = @inet_pton($ip);
+    $base = @inet_pton($network);
+    if ($address === false || $base === false || strlen($address) !== strlen($base)) return false;
+    $bits = (int) $prefix;
+    $bytes = intdiv($bits, 8);
+    $remainder = $bits % 8;
+    if (substr($address, 0, $bytes) !== substr($base, 0, $bytes)) return false;
+    return $remainder === 0 || ((ord($address[$bytes]) ^ ord($base[$bytes])) & (0xff << (8 - $remainder))) === 0;
+}
+
+function phproxy_is_public_ip(string $ip): bool
+{
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        foreach (['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24',
+            '192.0.2.0/24', '192.88.99.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4'] as $range) {
+            if (phproxy_ip_in_cidr($ip, $range)) return false;
+        }
+        return true;
+    }
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) || !phproxy_ip_in_cidr($ip, '2000::/3')) return false;
+    foreach (['2001::/23', '2001:db8::/32', '2002::/16', '3fff::/20'] as $range) if (phproxy_ip_in_cidr($ip, $range)) return false;
+    return true;
+}
+
+function phproxy_normalize_host(string $host): string
+{
+    $host = strtolower(rtrim($host, '.'));
+    if (str_starts_with($host, '[') && str_ends_with($host, ']')) $host = substr($host, 1, -1);
+    if (filter_var($host, FILTER_VALIDATE_IP)) return $host;
+    if ($host === '' || strlen($host) > 253 || !str_contains($host, '.')) throw new InvalidArgumentException('A fully qualified hostname is required');
+    foreach (explode('.', $host) as $label) {
+        if (!preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/D', $label)) throw new InvalidArgumentException('Invalid hostname');
+    }
+    // Reject ambiguous numeric IPv4 forms rather than relying on libc interpretation.
+    if (preg_match('/^[0-9.]+$/D', $host)) throw new InvalidArgumentException('Invalid IP address');
+    return $host;
+}
+
+function phproxy_remaining_time(float $deadline): float
+{
+    $remaining = $deadline - microtime(true);
+    if ($remaining <= 0) throw new RuntimeException('Request deadline exceeded', 408);
+    return $remaining;
+}
+
+function phproxy_resolve_public_host(string $host, float $deadline): array
+{
+    $host = phproxy_normalize_host($host);
+    phproxy_remaining_time($deadline);
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $addresses = [$host];
+    } else {
+        // A trailing dot prevents resolver search-domain expansion. PHP's system
+        // DNS call cannot be interrupted; OS resolver timeouts still apply here.
+        $records = @dns_get_record($host . '.', DNS_A | DNS_AAAA);
+        phproxy_remaining_time($deadline);
+        if (!is_array($records)) throw new RuntimeException('DNS lookup failed');
+        $addresses = [];
+        foreach ($records as $record) {
+            $address = $record['ip'] ?? $record['ipv6'] ?? null;
+            if (is_string($address)) $addresses[] = $address;
+        }
+    }
+    $addresses = array_values(array_unique($addresses));
+    if (!$addresses) throw new RuntimeException('No usable destination addresses');
+    foreach ($addresses as $address) if (!phproxy_is_public_ip($address)) throw new InvalidArgumentException('Destination is outside the permitted public network');
+    return $addresses;
+}
+
+function phproxy_open_public_socket(string $host, int $port, bool $tls, float $deadline, array $ssl_options = [], bool $inspect_certificate = false, ?string $pinned_address = null)
+{
+    $host = phproxy_normalize_host($host);
+    if ($port < 1 || $port > 65535) throw new InvalidArgumentException('Invalid port');
+    $addresses = $pinned_address === null ? phproxy_resolve_public_host($host, $deadline) : [$pinned_address];
+    foreach ($addresses as $candidate) if (!phproxy_is_public_ip($candidate)) throw new InvalidArgumentException('Destination is outside the permitted public network');
+    // Choose one validated address. Never pass a hostname to the connector,
+    // which would resolve it a second time after the security decision.
+    $address = $addresses[0];
+    $endpoint = str_contains($address, ':') ? '[' . $address . ']' : $address;
+    $ssl = array_merge($ssl_options, ['peer_name' => $host, 'SNI_enabled' => true,
+        'verify_peer' => !$inspect_certificate, 'verify_peer_name' => !$inspect_certificate,
+        'allow_self_signed' => $inspect_certificate, 'disable_compression' => true]);
+    $context = stream_context_create(['ssl' => $ssl]);
+    $socket = @stream_socket_client('tcp://' . $endpoint . ':' . $port, $errno, $errstr, phproxy_remaining_time($deadline), STREAM_CLIENT_CONNECT, $context);
+    if ($socket === false) throw new RuntimeException('Unable to connect to destination');
+    try {
+        phproxy_set_stream_deadline($socket, $deadline);
+        if ($tls) {
+            $method = $ssl_options['crypto_method'] ?? (STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT);
+            if (@stream_socket_enable_crypto($socket, true, $method) !== true) throw new RuntimeException('TLS handshake or certificate verification failed');
+        }
+        phproxy_remaining_time($deadline);
+        return $socket;
+    } catch (Throwable $e) {
+        fclose($socket);
+        throw $e;
+    }
+}
+
+function phproxy_set_stream_deadline($stream, float $deadline): void
+{
+    $remaining = phproxy_remaining_time($deadline);
+    $seconds = (int) floor($remaining);
+    $micros = max(1, (int) (($remaining - $seconds) * 1000000));
+    stream_set_timeout($stream, $seconds, $micros);
+}
+
+function phproxy_stream_write_all($stream, string $bytes, float $deadline): void
+{
+    $offset = 0;
+    $length = strlen($bytes);
+    while ($offset < $length) {
+        phproxy_set_stream_deadline($stream, $deadline);
+        $written = @fwrite($stream, substr($bytes, $offset, 65536));
+        if ($written === false || $written === 0) throw new RuntimeException('Upstream write failed');
+        $offset += $written;
+    }
+}
+
+function phproxy_stream_read($stream, int $length, float $deadline): string
+{
+    phproxy_set_stream_deadline($stream, $deadline);
+    $data = @fread($stream, $length);
+    $meta = stream_get_meta_data($stream);
+    if (!empty($meta['timed_out'])) throw new RuntimeException('Upstream read timed out', 408);
+    phproxy_remaining_time($deadline);
+    if ($data === false || ($data === '' && !feof($stream))) throw new RuntimeException('Upstream read failed');
+    return $data;
+}
+
+function phproxy_read_line($stream, float $deadline, int &$budget): string
+{
+    if ($budget < 2) throw new RuntimeException('Upstream headers exceed limit');
+    phproxy_set_stream_deadline($stream, $deadline);
+    $line = @fgets($stream, min($budget + 1, 8194));
+    $meta = stream_get_meta_data($stream);
+    if (!empty($meta['timed_out'])) throw new RuntimeException('Upstream read timed out', 408);
+    phproxy_remaining_time($deadline);
+    if ($line === false || !str_ends_with($line, "\r\n")) throw new RuntimeException('Incomplete or oversized upstream line');
+    $budget -= strlen($line);
+    if ($budget < 0) throw new RuntimeException('Upstream headers exceed limit');
+    return substr($line, 0, -2);
+}
+
+function phproxy_read_exact($stream, int $length, float $deadline): string
+{
+    $out = '';
+    while (strlen($out) < $length) {
+        $part = phproxy_stream_read($stream, min(8192, $length - strlen($out)), $deadline);
+        if ($part === '') throw new RuntimeException('Incomplete upstream body');
+        $out .= $part;
+    }
+    return $out;
+}
+
+function phproxy_read_chunked_body($stream, float $deadline, int $limit): string
+{
+    $body = '';
+    $line_budget = 65536;
+    while (true) {
+        $line = phproxy_read_line($stream, $deadline, $line_budget);
+        if (!preg_match('/^([0-9a-fA-F]{1,8})(?:;[^\x00-\x1f\x7f]*)?$/D', $line, $match)) throw new RuntimeException('Invalid chunk framing');
+        $size = (int) hexdec($match[1]);
+        if ($size > $limit - strlen($body)) throw new RuntimeException('Upstream body exceeds limit');
+        if ($size === 0) {
+            $trailer_budget = 8192;
+            while (($trailer = phproxy_read_line($stream, $deadline, $trailer_budget)) !== '') {
+                if (!preg_match('/^[!#$%&\'*+.^_`|~0-9A-Za-z-]+:[\x09\x20-\x7e\x80-\xff]*$/D', $trailer)) throw new RuntimeException('Invalid trailer');
+            }
+            return $body;
+        }
+        $body .= phproxy_read_exact($stream, $size, $deadline);
+        if (phproxy_read_exact($stream, 2, $deadline) !== "\r\n") throw new RuntimeException('Invalid chunk terminator');
+    }
+}
+
+function phproxy_prepare_request_headers($input): array
+{
+    if (!is_array($input)) throw new InvalidArgumentException('Headers must be an object');
+    $headers = [];
+    $size = 0;
+    $blocked = ['host', 'connection', 'content-length', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'keep-alive', 'proxy-authorization', 'proxy-connection', 'expect'];
+    foreach ($input as $name => $value) {
+        if (!is_string($name) || !preg_match('/^[!#$%&\'*+.^_`|~0-9A-Za-z-]+$/D', $name) || !is_scalar($value)) throw new InvalidArgumentException('Invalid request header');
+        $name = strtolower($name);
+        $value = (string) $value;
+        if (preg_match('/[\x00-\x08\x0a-\x1f\x7f]/', $value)) throw new InvalidArgumentException('Invalid request header value');
+        if (in_array($name, $blocked, true)) continue;
+        if (isset($headers[$name])) throw new InvalidArgumentException('Duplicate request header');
+        $size += strlen($name) + strlen($value) + 4;
+        if ($size > 32768) throw new InvalidArgumentException('Request headers exceed 32 KiB');
+        $headers[$name] = $value;
+    }
+    return $headers;
+}
+
+function phproxy_parse_http_url(string $url): array
+{
+    if ($url === '' || strlen($url) > 8192 || preg_match('/[\x00-\x20\x7f\\\\]/', $url)) throw new InvalidArgumentException('Invalid URL');
+    $parts = @parse_url($url);
+    if (!is_array($parts) || !isset($parts['scheme'], $parts['host']) || isset($parts['user']) || isset($parts['pass'])) throw new InvalidArgumentException('URL must have a host and no credentials');
+    $scheme = strtolower($parts['scheme']);
+    if (!in_array($scheme, ['http', 'https'], true)) throw new InvalidArgumentException('Only HTTP and HTTPS are supported');
+    $host = phproxy_normalize_host($parts['host']);
+    $port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
+    if ($port < 1 || $port > 65535) throw new InvalidArgumentException('Invalid port');
+    $display_host = str_contains($host, ':') ? '[' . $host . ']' : $host;
+    $authority = $display_host . ($port !== ($scheme === 'https' ? 443 : 80) ? ':' . $port : '');
+    $path = ($parts['path'] ?? '') ?: '/';
+    if ($path[0] !== '/') throw new InvalidArgumentException('Invalid request target');
+    $path .= isset($parts['query']) ? '?' . $parts['query'] : '';
+    return ['scheme' => $scheme, 'host' => $host, 'port' => $port, 'authority' => $authority,
+        'origin' => $scheme . '://' . $display_host . ':' . $port, 'path' => $path];
+}
+
+function phproxy_remove_dot_segments(string $path): string
+{
+    $output = '';
+    while ($path !== '') {
+        if (str_starts_with($path, '../')) $path = substr($path, 3);
+        elseif (str_starts_with($path, './')) $path = substr($path, 2);
+        elseif (str_starts_with($path, '/./')) $path = substr($path, 2);
+        elseif ($path === '/.') $path = '/';
+        elseif (str_starts_with($path, '/../') || $path === '/..') {
+            $path = $path === '/..' ? '/' : substr($path, 3);
+            $output = preg_replace('#/?[^/]*$#', '', $output);
+        } elseif ($path === '.' || $path === '..') $path = '';
+        else {
+            $end = strpos($path, '/', $path[0] === '/' ? 1 : 0);
+            if ($end === false) { $output .= $path; $path = ''; }
+            else { $output .= substr($path, 0, $end); $path = substr($path, $end); }
+        }
+    }
+    return $output;
+}
+
+function phproxy_resolve_http_location(string $base, string $location): string
+{
+    if (strlen($location) > 8192 || preg_match('/[\x00-\x20\x7f\\\\]/', $location)) throw new RuntimeException('Invalid redirect location');
+    $base_parts = parse_url($base);
+    $ref = parse_url($location);
+    if ($ref === false) throw new RuntimeException('Invalid redirect location');
+    if (isset($ref['scheme'])) {
+        phproxy_parse_http_url($location);
+        return $location;
+    }
+    if (str_starts_with($location, '//')) {
+        $result = $base_parts['scheme'] . ':' . $location;
+        phproxy_parse_http_url($result);
+        return $result;
+    }
+    $target = phproxy_parse_http_url($base);
+    $base_path = $base_parts['path'] ?? '/';
+    $ref_path = $ref['path'] ?? '';
+    if ($ref_path === '') {
+        $path = $base_path;
+        $query = $ref['query'] ?? $base_parts['query'] ?? null;
+    } else {
+        $path = $ref_path[0] === '/' ? $ref_path : substr($base_path, 0, (int) strrpos($base_path, '/') + 1) . $ref_path;
+        $path = phproxy_remove_dot_segments($path);
+        $query = $ref['query'] ?? null;
+    }
+    $result = $target['scheme'] . '://' . $target['authority'] . ($path ?: '/') . ($query !== null ? '?' . $query : '');
+    phproxy_parse_http_url($result);
+    return $result;
+}
+
+function phproxy_read_http_response($stream, string $method, float $deadline, int $limit): array
+{
+    $budget = 65536;
+    $interim = 0;
+    do {
+        $status_line = phproxy_read_line($stream, $deadline, $budget);
+        if (!preg_match('#^HTTP/1\.[01] ([1-5][0-9]{2})(?: ([\x20-\x7e\x80-\xff]*))?$#D', $status_line, $match)) throw new RuntimeException('Invalid upstream status');
+        $status = (int) $match[1];
+        $status_text = $match[2] ?? '';
+        $values = [];
+        $header_lines = [];
+        while (($line = phproxy_read_line($stream, $deadline, $budget)) !== '') {
+            if (!preg_match('/^([!#$%&\'*+.^_`|~0-9A-Za-z-]+):([\x09\x20-\x7e\x80-\xff]*)$/D', $line, $match)) throw new RuntimeException('Invalid upstream header');
+            $name = strtolower($match[1]);
+            $value = trim($match[2]);
+            $values[$name][] = $value;
+            $header_lines[] = ['name' => $name, 'value' => $value];
+        }
+        if ($status === 101 || ++$interim > 5) throw new RuntimeException('Unsupported upstream protocol response');
+    } while ($status < 200);
+    $no_body = $method === 'HEAD' || in_array($status, [204, 304], true);
+    $body = '';
+    if (!$no_body) {
+        if (isset($values['transfer-encoding'], $values['content-length'])) throw new RuntimeException('Ambiguous upstream framing');
+        if (isset($values['transfer-encoding'])) {
+            if (count($values['transfer-encoding']) !== 1 || strtolower($values['transfer-encoding'][0]) !== 'chunked') throw new RuntimeException('Unsupported transfer encoding');
+            $body = phproxy_read_chunked_body($stream, $deadline, $limit);
+        } elseif (isset($values['content-length'])) {
+            $length = $values['content-length'][0];
+            if (count($values['content-length']) !== 1 || !preg_match('/^[0-9]{1,10}$/D', $length) || (float) $length > $limit) throw new RuntimeException('Invalid or oversized upstream body length');
+            $body = phproxy_read_exact($stream, (int) $length, $deadline);
+        } else {
+            while (!feof($stream)) {
+                $part = phproxy_stream_read($stream, min(8192, $limit - strlen($body) + 1), $deadline);
+                if ($part === '') break;
+                $body .= $part;
+                if (strlen($body) > $limit) throw new RuntimeException('Upstream body exceeds limit');
+            }
+        }
+    }
+    $decoded = false;
+    if (!$no_body && isset($values['content-encoding']) && $body !== '') {
+        $encoding = strtolower(implode(', ', $values['content-encoding']));
+        if ($encoding === 'gzip' && function_exists('gzdecode')) {
+            $result = @gzdecode($body, $limit);
+            if ($result === false) throw new RuntimeException('Invalid or oversized compressed response');
+            $body = $result;
+            $decoded = true;
+        } elseif ($encoding === 'deflate' && function_exists('gzuncompress')) {
+            $result = @gzuncompress($body, $limit);
+            if ($result === false) $result = @gzinflate($body, $limit);
+            if ($result === false) throw new RuntimeException('Invalid or oversized compressed response');
+            $body = $result;
+            $decoded = true;
+        }
+    }
+    phproxy_remaining_time($deadline);
+    $drop = array_fill_keys(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length', 'set-cookie'], true);
+    foreach ($values['connection'] ?? [] as $connection) foreach (explode(',', $connection) as $name) $drop[strtolower(trim($name))] = true;
+    if ($decoded) $drop['content-encoding'] = true;
+    $headers = [];
+    $safe_lines = [];
+    foreach ($header_lines as $line) {
+        if (isset($drop[$line['name']])) continue;
+        $safe_lines[] = $line;
+        $headers[$line['name']] = isset($headers[$line['name']]) ? $headers[$line['name']] . ', ' . $line['value'] : $line['value'];
+    }
+    $set_cookie_headers = $values['set-cookie'] ?? [];
+    $set_cookies = [];
+    foreach ($set_cookie_headers as $cookie) $set_cookies[] = phproxy_parse_set_cookie($cookie);
+    return ['status' => $status, 'status_text' => $status_text, 'headers' => $headers, 'header_lines' => $safe_lines,
+        'set_cookie_headers' => $set_cookie_headers, 'set_cookies' => $set_cookies, 'body_raw' => $body];
+}
+
+function phproxy_parse_set_cookie(string $header): array
+{
+    $parts = preg_split('/;\s*/', $header);
+    $first = explode('=', (string) array_shift($parts), 2);
+    $cookie = ['name' => $first[0], 'value' => $first[1] ?? '', 'domain' => '', 'path' => '', 'expires' => '', 'max_age' => null, 'secure' => false, 'httponly' => false, 'samesite' => ''];
+    foreach ($parts as $part) {
+        [$name, $value] = array_pad(explode('=', $part, 2), 2, '');
+        $name = strtolower(trim($name));
+        if ($name === 'secure' || $name === 'httponly') $cookie[$name] = true;
+        elseif ($name === 'max-age') $cookie['max_age'] = (int) $value;
+        elseif (in_array($name, ['domain', 'path', 'expires', 'samesite'], true)) $cookie[$name] = trim($value);
+    }
+    return $cookie;
+}
+
+function phproxy_redirect_request(array $target, array $next, int $status, string $method, array $headers, string $body): array
+{
+    if ($target['scheme'] === 'https' && $next['scheme'] !== 'https') throw new RuntimeException('HTTPS downgrade redirect refused');
+    if (($status === 303 && $method !== 'HEAD') || (in_array($status, [301, 302], true) && $method === 'POST')) {
+        $method = 'GET';
+        $body = '';
+        foreach (['content-type', 'content-encoding', 'content-language', 'content-location', 'digest'] as $name) unset($headers[$name]);
+    }
+    if ($target['origin'] !== $next['origin']) {
+        // Custom credential names cannot be enumerated safely. Carry only
+        // representation preferences to another origin; discard cookies and auth.
+        $headers = array_intersect_key($headers, array_flip(['accept', 'accept-language', 'accept-encoding', 'user-agent']));
+        if ($body !== '') throw new RuntimeException('Cross-origin request-body redirect refused');
+    }
+    return [$method, $headers, $body];
+}
+
+function phproxy_valid_dns_name(string $host): bool
+{
+    $host = rtrim($host, '.');
+    if ($host === '' || strlen($host) > 253) return false;
+    foreach (explode('.', $host) as $label) {
+        if (!preg_match('/^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/D', $label)) return false;
+    }
+    return true;
+}
+
+function phproxy_api_origin_allowed(string $origin, string $public_url): bool
+{
+    $parts = @parse_url($origin);
+    if (!is_array($parts) || isset($parts['path']) || isset($parts['query']) || isset($parts['fragment'])) return false;
+    $normalized = phproxy_request_origin($origin);
+    return $normalized !== '' && $normalized === phproxy_request_origin($public_url);
+}
+
+/** Validate browsing context and produce a fresh proxy-local return URL. */
+function phproxy_browsing_return(string $return_to, string $return_url, string $tab = 'options'): ?string
+{
+    global $_config, $_flags, $_frozen_flags;
+    $script = phproxy_public_script_url($_SERVER);
+    $prefix = $script . '?' . $_config['url_var_name'] . '=';
+    if (!str_starts_with($return_to, $prefix) || strlen($return_to) > 32768) return null;
+    $token = substr($return_to, strlen($prefix));
+    if ($token === '' || preg_match('/[\x00-\x20\x7f&#]/', $token)) return null;
+    try {
+        $target = phproxy_parse_http_url($return_url);
+    } catch (Throwable $e) {
+        return null;
+    }
+    $url = $target['scheme'] . '://' . $target['authority'] . $target['path'];
+    $allowed_tabs = ['options', 'cookies', 'headers', 'response', 'network', 'cli', 'ip', 'dns', 'port', 'cert'];
+    if (!in_array($tab, $allowed_tabs, true)) $tab = 'options';
+    if (in_array($tab, ['port', 'cert'], true) && getenv('PHPROXY_DIAGNOSTICS') !== '1') $tab = 'options';
+    // Actions execute before the normal flag decoder. Reuse the saved encoding
+    // mode, while key rotation/expiry deliberately produces a fresh URL token.
+    $saved_flags = $_flags;
+    $cookie_flags = $_COOKIE['flags'] ?? '';
+    if (is_string($cookie_flags) && preg_match('/^[a-f0-9]{1,5}$/iD', $cookie_flags)) {
+        $bits = substr(str_pad(base_convert($cookie_flags, 16, 2), count($_flags), '0', STR_PAD_LEFT), -count($_flags));
+        $offset = 0;
+        foreach ($_flags as $name => $value) {
+            $_flags[$name] = !empty($_frozen_flags[$name]) ? $value : (int) $bits[$offset];
+            $offset++;
+        }
+    }
+    try {
+        return $prefix . encode_url($url) . '&panel=' . $tab;
+    } finally {
+        $_flags = $saved_flags;
+    }
+}
+
+/** Management controls rendered only in the trusted outer browsing shell. */
+function phproxy_browsing_panel(string $current_proxy_url, string $current_url): string
+{
+    $buckets = phproxy_panel_buckets();
+    $trace = phproxy_trace_entries();
+    $globals = [
+        '_show_raw_values' => !empty($_COOKIE['phproxy-show-raw']),
+        '_visible_cookies' => $buckets['cookies'],
+        '_custom_headers' => $buckets['headers'],
+        '_header_origins' => $buckets['header_origins'] ?? [],
+        '_ua_presets' => phproxy_ua_presets(),
+    ];
+    $previous = [];
+    foreach ($globals as $name => $value) {
+        $previous[$name] = [array_key_exists($name, $GLOBALS), $GLOBALS[$name] ?? null];
+        $GLOBALS[$name] = $value;
+    }
+    $active = is_string($_GET['panel'] ?? null) ? $_GET['panel'] : 'options';
+    if (!in_array($active, ['options', 'cookies', 'headers', 'response', 'network', 'cli', 'ip', 'dns', 'port', 'cert'], true)
+        || (in_array($active, ['port', 'cert'], true) && getenv('PHPROXY_DIAGNOSTICS') !== '1')
+        || ($active === 'response' && !$trace)) $active = 'options';
+    $escape = static fn(string $value): string => htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $script = phproxy_public_script_url($_SERVER);
+    $form_id = 'phproxy-browsing-options';
+    $level = ob_get_level();
+    ob_start();
+    try {
+        echo '<form id="' . $form_id . '" class="tab-actions" method="post" action="' . $escape($script) . '">';
+        echo phproxy_csrf_field();
+        echo '<input type="hidden" name="' . $escape($GLOBALS['_config']['url_var_name']) . '" value="' . $escape($current_url) . '">';
+        echo '<input type="hidden" name="phproxy_panel_context" value="1">';
+        echo '<button class="button-submit" type="submit">Apply options and reload this page</button></form>';
+        phproxy_render_panel_tabs(
+            return_to: $current_proxy_url,
+            show_response: !empty($trace),
+            request_pairs: $trace['request_pairs'] ?? [],
+            response_pairs: $trace['response_pairs'] ?? [],
+            request_line: $trace['request_line'] ?? '',
+            active_tab: $active,
+            form_id: $form_id,
+            show_cli: true,
+            cli_url: $current_url,
+            cli_method: $trace['method'] ?? 'GET',
+            cli_headers: $trace['request_pairs'] ?? [],
+            show_network: true,
+            network_entries: phproxy_network_entries(),
+            network_current_url: $current_url,
+            show_netchecks: true,
+            show_cert: getenv('PHPROXY_DIAGNOSTICS') === '1',
+            cert_host: (string) parse_url($current_url, PHP_URL_HOST),
+            cert_port: (int) (parse_url($current_url, PHP_URL_PORT) ?: 443),
+            return_url: $current_url
+        );
+        return (string) ob_get_clean();
+    } finally {
+        while (ob_get_level() > $level) ob_end_clean();
+        foreach ($previous as $name => [$present, $value]) {
+            if ($present) $GLOBALS[$name] = $value;
+            else unset($GLOBALS[$name]);
+        }
+    }
 }
